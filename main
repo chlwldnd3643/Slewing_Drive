@@ -1,0 +1,222 @@
+/*
+ * CANopen Drive Control – Seeed Studio MCP2515 (Final)
+ * HW: Arduino UNO/MEGA + Seeed CAN-BUS Shield v2.0 (CS=D9, INT=D2), 16MHz crystal, 250 kbps
+ * Lib: Seeed Studio (mcp2515_can.h / class mcp2515_can)
+ *
+ * PDO (assumed default):
+ * RPDO1 (0x200 + NODE_ID): 0x6040 Controlword (uint16), 0x607A Target Position (int32)
+ * TPDO1 (0x180 + NODE_ID): 0x6041 Statusword (uint16), 0x6064 Position Actual Value (int32)
+ *
+ * Sequence:
+ *  - NMT Pre-Op -> SDO: 0x6060:00 = 1 (Profile Position) -> NMT Start
+ *  - CiA-402: Shutdown -> Switch On -> Enable Operation
+ *  - PP Move: NEW_SETPOINT bit (bit4) edge, option RELATIVE(bit6), CHANGE_IMMED(bit5)
+ */
+
+#include <SPI.h>
+#include <mcp2515_can.h>   // ★ Seeed 전용 구현 헤더
+
+// ---------- User config ----------
+const uint8_t  NODE_ID       = 5;            // Drive node id
+const uint32_t CAN_BAUD      = CAN_250KBPS;  // 250 kbps
+const bool     MCP2515_16MHZ = true;         // Seeed v2.0 기본 16MHz
+const uint8_t  PIN_CS        = 9;            // ★ v2.0 기본 CS=D9
+const uint8_t  PIN_INT       = 2;            // INT=D2 (보드 점퍼 확인)
+
+// ---------- COB-IDs ----------
+#define COBID_TPDO1 (0x180 + NODE_ID)  // Drive -> Master
+#define COBID_RPDO1 (0x200 + NODE_ID)  // Master -> Drive
+#define COBID_NMT    0x000
+#define COBID_SDO_TX (0x600 + NODE_ID) // Master -> Drive
+#define COBID_SDO_RX (0x580 + NODE_ID) // Drive -> Master
+
+// ---------- Controlword bits (CiA-402) ----------
+#define CW_SHUTDOWN           0x0006
+#define CW_SWITCH_ON          0x0007
+#define CW_ENABLE_OPERATION   0x000F
+#define CW_NEW_SETPOINT_BIT   (1 << 4)   // bit4
+#define CW_CHANGE_IMMED_BIT   (1 << 5)   // bit5 (optional)
+#define CW_RELATIVE_BIT       (1 << 6)   // bit6: 1=relative
+#define CW_FAULT_RESET_BIT    (1 << 7)   // bit7
+
+// ---------- Globals ----------
+mcp2515_can CAN(PIN_CS);
+
+// ---------- Utils: endian packers ----------
+static inline void u16_to_le(uint16_t v, uint8_t *d){ d[0]=uint8_t(v & 0xFF); d[1]=uint8_t(v >> 8); }
+static inline void s32_to_le(int32_t  v, uint8_t *d){ d[0]=uint8_t(v & 0xFF); d[1]=uint8_t((v>>8)&0xFF); d[2]=uint8_t((v>>16)&0xFF); d[3]=uint8_t((v>>24)&0xFF); }
+static inline uint16_t le_to_u16(const uint8_t *d){ return (uint16_t)d[0] | ((uint16_t)d[1] << 8); }
+static inline int32_t  le_to_s32(const uint8_t *d){
+  return (int32_t)((uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24));
+}
+
+// ---------- Common CAN send helper (retry + wait_sent=1) ----------
+bool can_send_retry(unsigned long cobid, const byte* d, byte len, byte retries=3){
+  while (retries--){
+    byte rc = CAN.sendMsgBuf(cobid, /*ext=*/0, /*rtr=*/0, len, (byte*)d, /*wait_sent=*/1);
+    if (rc == CAN_OK) return true;
+    delay(2);
+  }
+  return false;
+}
+
+// ---------- NMT ----------
+bool sendNMT(uint8_t cmd, uint8_t node){
+  uint8_t data[2] = { cmd, node };
+  return can_send_retry(COBID_NMT, data, 2);
+}
+// NMT: 0x01 Start, 0x02 Stop, 0x81 Pre-Op, 0x80 Reset Comm, 0x82 Reset Node
+
+// ---------- SDO write (expedited, size 1) ----------
+bool sdo_write_u8(uint16_t index, uint8_t sub, uint8_t val){
+  // CCS=001b(write), expedited, size=1 → 0x2F
+  uint8_t d[8] = {0x2F, (uint8_t)(index & 0xFF), (uint8_t)(index >> 8), sub, val, 0,0,0};
+  if (!can_send_retry(COBID_SDO_TX, d, 8)) return false;
+
+  // wait for SDO response (0x60) briefly
+  unsigned long t0 = millis();
+  while (millis() - t0 < 100){
+    if (CAN_MSGAVAIL == CAN.checkReceive()){
+      byte len; byte buf[8];
+      if (CAN.readMsgBuf(&len, buf) == CAN_OK){
+        unsigned long rid = CAN.getCanId();
+        if (rid == COBID_SDO_RX && len >= 8 && buf[0] == 0x60 &&
+            buf[1] == (uint8_t)(index & 0xFF) && buf[2] == (uint8_t)(index >> 8) && buf[3] == sub){
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// ---------- RPDO1: Controlword + TargetPosition ----------
+bool send_RPDO1(uint16_t controlword, int32_t target_pos_inc){
+  uint8_t d[8] = {0};
+  u16_to_le(controlword, &d[0]);         // 0..1 : 0x6040
+  s32_to_le(target_pos_inc, &d[2]);      // 2..5 : 0x607A
+  return can_send_retry(COBID_RPDO1, d, 8);
+}
+
+// ---------- TPDO1: Statusword + ActualPosition ----------
+bool read_TPDO1(int32_t &actual_pos_inc, uint16_t &statusword){
+  if (CAN_MSGAVAIL != CAN.checkReceive()) return false;
+
+  byte len; byte buf[8];
+  if (CAN.readMsgBuf(&len, buf) != CAN_OK) return false;
+  unsigned long rxId = CAN.getCanId();
+  if (rxId != COBID_TPDO1 || len < 6) return false;
+
+  statusword      = le_to_u16(&buf[0]);   // 0..1 : 0x6041
+  actual_pos_inc  = le_to_s32(&buf[2]);   // 2..5 : 0x6064
+  return true;
+}
+
+// ---------- Statusword decode (quick view) ----------
+void print_status(uint16_t sw){
+  bool rdy   = sw & (1<<0);
+  bool swon  = sw & (1<<1);
+  bool enop  = sw & (1<<2);
+  bool fault = sw & (1<<3);
+  bool qstop = sw & (1<<5);
+  Serial.print(F(" [RDY="));  Serial.print(rdy);
+  Serial.print(F(" SW="));    Serial.print(swon);
+  Serial.print(F(" EN="));    Serial.print(enop);
+  Serial.print(F(" FLT="));   Serial.print(fault);
+  Serial.print(F(" QST="));   Serial.print(qstop);
+  Serial.print(F("]"));
+}
+
+// ---------- Fault Reset ----------
+bool fault_reset(){
+  if (!send_RPDO1(CW_FAULT_RESET_BIT, 0)) return false; // set bit7
+  delay(10);
+  return send_RPDO1(0x0000, 0);                         // clear
+}
+
+// ---------- PP move (relative / change_immed options) ----------
+bool move_profile_position_ex(int32_t target_inc, bool relative=true, bool change_immed=true){
+  uint16_t cw = CW_ENABLE_OPERATION | CW_NEW_SETPOINT_BIT;
+  if (relative)     cw |= CW_RELATIVE_BIT;
+  if (change_immed) cw |= CW_CHANGE_IMMED_BIT;
+
+  if (!send_RPDO1(cw, target_inc)) return false;
+  delay(5);
+  cw &= ~CW_NEW_SETPOINT_BIT;   // edge clear
+  return send_RPDO1(cw, target_inc);
+}
+
+// ---------- Setup ----------
+void setup(){
+  Serial.begin(115200);
+  while (!Serial) {}
+
+  pinMode(PIN_INT, INPUT);
+
+  byte rc;
+  if (MCP2515_16MHZ) rc = CAN.begin(CAN_BAUD, MCP_16MHz);
+  else               rc = CAN.begin(CAN_BAUD, MCP_8MHz);
+
+  if (rc == CAN_OK){
+    Serial.println(F("CAN init OK"));
+  } else {
+    Serial.println(F("CAN init FAIL"));
+    while(1) {}
+  }
+
+  CAN.setMode(MODE_NORMAL);
+  delay(100);
+
+  // 1) Pre-Operational로 전환 (SDO 설정 위해)
+  sendNMT(0x81, NODE_ID);  // Enter Pre-Op
+  delay(50);
+
+  // 2) Fault 있으면 리셋
+  fault_reset();
+  delay(20);
+
+  // 3) 모드: Profile Position (0x6060:00 = 1)
+  if (sdo_write_u8(0x6060, 0x00, 1)){
+    Serial.println(F("SDO: 6060:00 = 1 (PP) OK"));
+  } else {
+    Serial.println(F("SDO: 6060:00 write FAIL (check SDO permissions/state)"));
+  }
+  delay(20);
+
+  // 4) Start + Enable sequence
+  sendNMT(0x01, NODE_ID);         // Start
+  delay(50);
+  send_RPDO1(CW_SHUTDOWN, 0);     delay(20);
+  send_RPDO1(CW_SWITCH_ON, 0);    delay(20);
+  send_RPDO1(CW_ENABLE_OPERATION,0); delay(20);
+
+  Serial.println(F("State: ENABLE OP requested"));
+}
+
+// ---------- Demo: 2초마다 왕복 ----------
+int32_t stepA =  +100000;   // increments
+int32_t stepB =  -100000;
+uint32_t lastMoveMs = 0;
+bool flip = true;
+
+void loop(){
+  // 주기적 조그 (상대이동 + 즉시적용)
+  if (millis() - lastMoveMs > 2000){
+    int32_t t = flip ? stepA : stepB;
+    if (move_profile_position_ex(t, /*relative=*/true, /*change_immed=*/true)){
+      Serial.print(F("Move cmd -> ")); Serial.println(t);
+    } else {
+      Serial.println(F("Move cmd FAIL"));
+    }
+    flip = !flip;
+    lastMoveMs = millis();
+  }
+
+  // TPDO1 모니터링
+  int32_t act; uint16_t sw;
+  if (read_TPDO1(act, sw)){
+    Serial.print(F("TPDO1 | SW=0x")); Serial.print(sw, HEX);
+    print_status(sw);
+    Serial.print(F("  POS="));        Serial.println(act);
+  }
+}
