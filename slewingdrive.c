@@ -48,7 +48,7 @@ bool waitSDO(uint16_t index, uint8_t sub, uint32_t timeout_ms = 200){
             if (buf[0]==0x60) return true;  // SDO ack
             if (buf[0]==0x80) return false; // SDO abort
           }
-        }
+        } 
       }
     }
   }
@@ -129,44 +129,35 @@ void NMT_cmd(uint8_t cmd, uint8_t node){ uint8_t d[2]={cmd,node}; sendCAN(COB_NM
 void NMT_start(uint8_t node){ NMT_cmd(0x01, node); }
 void NMT_preop(uint8_t node){ NMT_cmd(0x80, node); }
 
-/* ========= Enable (PP mode) ========= */
-bool enable_drive_profile_position(){
+/* ========= FAST ENABLE (0x0086 → 0x103F) ========= */
+bool enable_drive_fast(){
+  Serial.println(F("[FAST] Mode=PP (0x6060=1) & profile params"));
+  // 모드/프로파일 (ACK 없이 빠르게) — 필요 시 단위 맞춰 조정
+  SDO_write_u8 (0x6060,0x00,1,false);     // Profile Position
+  if (USE_605A) SDO_write_u16(0x605A,0x00,0x0000,false); // QuickStop option (optional)
+    // 예: 목표속도 30rpm, CPR=65536 → 32768 counts/s
+  SDO_write_u32(0x6081,0x00, 10000000, true);  // Profile Velocity, 17920 = 1rpm
+  SDO_write_u32(0x607F,0x00, 50000000, true);  // Max Profile Velocity
+  SDO_write_u32(0x6083,0x00, 366200, true);  // Accel (3662=1rps/s)
+  SDO_write_u32(0x6084,0x00, 366200, true);  // Decel
+  SDO_write_u8 (0x6086,0x00, 0, true);      // Trapezoidal
+
+
+  Serial.println(F("[FAST] CW=0x0086 (fault reset + shutdown-ish)"));
+  SDO_write_u16(0x6040,0x00,0x0086,false);
+  delay(10);
+
+  Serial.println(F("[FAST] CW=0x103F (Enable+NewSP+ChangeImmed)"));
+  bool ok = SDO_write_u16(0x6040,0x00,0x103F,false);
+  delay(10);
+
   uint16_t sw=0;
-  Serial.println(F("[S] Step0: Fault Reset (0x6040=0x0080)"));
-  SDO_write_u16(0x6040,0x00,0x0080,false); // Fault reset (no-ACK)
-
-  if (USE_605A){
-    Serial.println(F("[S] Step1: QuickStop option -> 0 (0x605A=0)"));
-    SDO_write_u16(0x605A,0x00,0x0000,false);
-  } else {
-    Serial.println(F("[S] Step1: (skip 0x605A per config)"));
-  }
-
-  Serial.println(F("[S] Step2: Mode=Profile Position (0x6060=1)"));
-  SDO_write_u8(0x6060,0x00,1,false); // PP mode
-
-  // ===== 기본 프로파일 파라미터(예시값: 단위=counts/s, counts/s^2) =====
-  // 드라이브 단위/스케일 맞춰서 조정하라.
-  SDO_write_u32(0x607F,0x00,40000,false); // Max Profile Velocity (상한)
-  SDO_write_u32(0x6081,0x00,20000,false); // Profile Velocity (목표속도)
-  SDO_write_u32(0x6083,0x00,50000,false); // Profile Acceleration
-  SDO_write_u32(0x6084,0x00,50000,false); // Profile Deceleration
-  SDO_write_u8 (0x6086,0x00,0,false);     // Motion Profile Type (0=Trap, 벤더 의존)
-
-  Serial.println(F("[S] Step3: CW=0 -> 0x06 -> 0x07 -> 0x0F"));
-  SDO_write_u16(0x6040,0x00,0x0000,false);
-  SDO_write_u16(0x6040,0x00,0x0006,false);
-  SDO_write_u16(0x6040,0x00,0x0007,false);
-  SDO_write_u16(0x6040,0x00,0x000F,false);
-
   if (SDO_read_u16(0x6041,0x00,&sw)) {
     printStatusWord(sw);
-    if ((sw & 0x0007) == 0x0007){ Serial.println(F("[S] ✔ Operation Enabled")); return true; }
   } else {
-    Serial.println(F("[S] WARN: no SW read"));
+    Serial.println(F("[FAST] WARN: SW read fail"));
   }
-  Serial.println(F("[S] ✖ Not enabled. Use SCAN/PING/SNIFF."));
-  return false;
+  return ok;
 }
 
 /* ========= Diagnostics ========= */
@@ -239,7 +230,6 @@ void handleCommand(String cmd){
     return;
   }
 
-  // MD (Mode Display)
   if (cmd=="MD") {
     uint32_t v=0;
     if (SDO_read_u32(0x6061,0x00,&v)) {
@@ -248,49 +238,6 @@ void handleCommand(String cmd){
       Serial.println(md);
     } else {
       Serial.println(F("[MD] read FAIL"));
-    }
-    return;
-  }
-
-  // MAP/MAPALL/MAPSET (벤더 확장 0x60FE 예시)
-  if (cmd=="MAPALL") {
-    uint32_t n=0;
-    if (SDO_read_u32(0x60FE,0x00,&n)) {
-      Serial.print(F("[MAP] count=")); Serial.println(n);
-      uint32_t v=0;
-      for (uint8_t sub=1; sub<=min((uint32_t)8,n); ++sub){
-        if (SDO_read_u32(0x60FE, sub, &v)) {
-          Serial.print(F("[MAP] 0x60FE:")); Serial.print(sub); Serial.print(F("=0x")); Serial.println(v,HEX);
-        } else {
-          Serial.print(F("[MAP] read FAIL @ sub ")); Serial.println(sub);
-        }
-      }
-    } else {
-      Serial.println(F("[MAP] 0x60FE:00 read FAIL"));
-    }
-    return;
-  }
-  if (cmd.startsWith("MAPSET ")) {
-    int sp = cmd.indexOf(' ');
-    String rest = cmd.substring(sp+1);
-    int sp2 = rest.indexOf(' ');
-    uint8_t sub = (uint8_t) rest.substring(0, sp2).toInt();
-    uint32_t val = (uint32_t) strtoul(rest.substring(sp2+1).c_str(), NULL, 0);
-    if (SDO_write_u32(0x60FE, sub, val, false)) {
-      Serial.print(F("[MAPSET] 0x60FE:")); Serial.print(sub); Serial.print(F("=0x")); Serial.println(val,HEX);
-    } else {
-      Serial.println(F("[MAPSET] write FAIL (RO or vendor-protect)"));
-    }
-    return;
-  }
-  if (cmd=="MAP") {
-    for (uint8_t sub=1; sub<=6; ++sub){
-      uint32_t v=0;
-      if (SDO_read_u32(0x60FE, sub, &v)) {
-        Serial.print(F("[MAP] 0x60FE:")); Serial.print(sub); Serial.print(F("=0x")); Serial.println(v,HEX);
-      } else {
-        Serial.print(F("[MAP] read FAIL @ sub ")); Serial.println(sub);
-      }
     }
     return;
   }
@@ -305,84 +252,16 @@ void handleCommand(String cmd){
     return;
   }
 
-  // Quick Stop 옵션
-  if (cmd.startsWith("QS ")) {
-    uint16_t op = (uint16_t)cmd.substring(3).toInt(); // 0~?
-    if (SDO_write_u16(0x605A,0x00,op,false)) { Serial.print(F("[CFG] 0x605A=")); Serial.println(op); }
-    else Serial.println(F("[CFG] set 0x605A FAIL"));
-    return;
-  }
-
-  // 강제 enable 시퀀스
-  if (cmd=="SFORCE") {
-    SDO_write_u16(0x6040,0x00,0x0080,false); delay(20); // Fault reset
-    SDO_write_u16(0x6040,0x00,0x0000,false); delay(10);
-    SDO_write_u16(0x6040,0x00,0x0006,false); delay(10);
-    SDO_write_u16(0x6040,0x00,0x0007,false); delay(10);
-    SDO_write_u16(0x6040,0x00,0x000F,false); delay(10);
-    uint16_t sw=0;
-    if (SDO_read_u16(0x6041,0x00,&sw)) printStatusWord(sw);
-    else Serial.println(F("[SFORCE] SW read FAIL"));
-    return;
-  }
-
-  // ==== Profile 파라미터 세팅 커맨드 ====
-  // VSET <rpm> <cpr>  -> rpm과 엔코더 카운트/회전(cpr)로 0x6081/0x607F 셋팅
-  if (cmd.startsWith("VSET ")) {
-    long rpm = 0, cpr = 0;
-    int sp = cmd.indexOf(' ');
-    int sp2 = cmd.indexOf(' ', sp+1);
-    if (sp2 > 0) {
-      rpm = cmd.substring(sp+1, sp2).toInt();
-      cpr = cmd.substring(sp2+1).toInt();
-      long v_counts_per_s = (long)((rpm * (long)cpr) / 60L);
-      if (!SDO_write_u32(0x607F, 0x00, (uint32_t)( (v_counts_per_s>0)? v_counts_per_s*2 : -v_counts_per_s*2 ), false))
-        Serial.println(F("[VSET] note: no ACK @ 0x607F"));
-      if (!SDO_write_u32(0x6081, 0x00, (uint32_t)((v_counts_per_s>=0)? v_counts_per_s : -v_counts_per_s), false))
-        Serial.println(F("[VSET] note: no ACK @ 0x6081"));
-      Serial.print(F("[VSET] rpm=")); Serial.print(rpm);
-      Serial.print(F(", cpr=")); Serial.print(cpr);
-      Serial.print(F(" -> 0x6081=")); Serial.println(v_counts_per_s);
+  if (cmd=="S"){  // <-- 빠른 Enable로 변경
+    Serial.println(F("[CMD] FAST START (0x0086 -> 0x103F)"));
+    if (enable_drive_fast()){
+      state=RUNNING; Serial.println(F("[CMD] ✔ Drive FAST-ENABLED (PP). Ready for targets."));
     } else {
-      Serial.println(F("Usage: VSET <rpm> <cpr>"));
+      Serial.println(F("[CMD] ✖ FAST enable may have failed. Try SCAN/PING/standard sequence."));
     }
     return;
   }
-  // ACC <counts_per_s2>
-  if (cmd.startsWith("ACC ")) {
-    long a = cmd.substring(4).toInt();
-    if (!SDO_write_u32(0x6083, 0x00, (uint32_t)a, false))
-      Serial.println(F("[ACC] note: no ACK @ 0x6083"));
-    else { Serial.print(F("[ACC] 0x6083=")); Serial.println(a); }
-    return;
-  }
-  // DEC <counts_per_s2>
-  if (cmd.startsWith("DEC ")) {
-    long d = cmd.substring(4).toInt();
-    if (!SDO_write_u32(0x6084, 0x00, (uint32_t)d, false))
-      Serial.println(F("[DEC] note: no ACK @ 0x6084"));
-    else { Serial.print(F("[DEC] 0x6084=")); Serial.println(d); }
-    return;
-  }
-  // PTYPE <0|1> (0=Trapezoidal, 1=S-curve … 벤더 의존)
-  if (cmd.startsWith("PTYPE ")) {
-    long t = cmd.substring(6).toInt();
-    if (!SDO_write_u8(0x6086, 0x00, (uint8_t)t, false))
-      Serial.println(F("[PTYPE] note: no ACK @ 0x6086"));
-    else { Serial.print(F("[PTYPE] 0x6086=")); Serial.println(t); }
-    return;
-  }
 
-  // ==== Enable / Stop ====
-  if (cmd=="S"){
-    Serial.println(F("[CMD] START requested"));
-    if (enable_drive_profile_position()){
-      state=RUNNING; Serial.println(F("[CMD] ✔ Drive ENABLED (PP). Ready for targets."));
-    } else {
-      Serial.println(F("[CMD] ✖ Enable FAILED (try SCAN/PING/SNIFF)"));
-    }
-    return;
-  }
   if (cmd=="STOP"){
     Serial.println(F("[CMD] STOP -> QuickStop+Shutdown"));
     SDO_write_u16(0x6040,0x00,0x000B,false); delay(10); // Quick stop
@@ -391,7 +270,6 @@ void handleCommand(String cmd){
     return;
   }
 
-  // 기본 진단
   if (cmd=="PING"){ cmdPING(); return; }
   if (cmd=="SCAN"){ cmdSCAN(); return; }
 
@@ -463,7 +341,7 @@ void setup(){
 
   CAN.setMode(MCP_NORMAL);
   NMT_start(0x00); // all nodes start (CANopen일 때 의미 있음)
-  Serial.println(F("READY. Type: SCAN / PING / S / STOP / ABS / REL / number / VSET / ACC / DEC / PTYPE / SNIFF ON|OFF"));
+  Serial.println(F("READY. Type: SCAN / PING / S / STOP / ABS <pos> / REL <inc> / number / ERR / MD / SNIFF ON|OFF"));
 }
 
 /* ========= Loop ========= */
