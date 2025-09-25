@@ -3,6 +3,7 @@
 
 /* ========= USER CONFIG ========= */
 uint8_t  NODE_ID         = 1;            // 대상 드라이브 Node-ID
+const bool MCP2515_16MHZ = true;         // MCP2515 클럭
 const uint8_t PIN_CS     = 9;
 const uint8_t PIN_INT    = 2;
 #define DEFAULT_BAUD      CAN_500KBPS     // 필요시 CAN_250KBPS 등으로
@@ -25,20 +26,18 @@ bool sendCAN(uint32_t id, const uint8_t* data, uint8_t len = 8){
   return CAN.sendMsgBuf(id, 0, len, (unsigned char*)data) == CAN_OK;
 }
 
-// 경험적 기본값: 대부분의 SDO는 수십 ms 내 응답 → 200ms면 충분(필요시 늘려라)
+// 경험적 기본값: 대부분의 SDO는 수십 ms 내 응답 → 200ms면 충분
 bool waitSDO(uint16_t index, uint8_t sub, uint32_t timeout_ms = 200){
   uint32_t t0 = millis();
   while (millis() - t0 < timeout_ms){
     if (CAN.checkReceive() == CAN_MSGAVAIL){
-      unsigned char len = 0, buf[8] = {0};
-      // SeeedStudio CAN_BUS_Shield: readMsgBuf(len, buf) 2-arg
-      if (CAN.readMsgBuf(&len, buf) == CAN_OK){
-        unsigned long rxId = CAN.getCanId();   // ID는 여기서 따로
+      unsigned long rxId=0; unsigned char len=0, buf[8]={0};
+      if (CAN.readMsgBuf(&rxId, &len, buf) == CAN_OK){
         if (rxId == COB_SDO_RX() && len >= 8){
           uint16_t idx = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
-          if (idx == index && buf[3] == sub){
-            if (buf[0] == 0x60) return true;   // SDO ack
-            if (buf[0] == 0x80) return false;  // SDO abort
+          if (idx == index && buf[3]==sub){
+            if (buf[0]==0x60) return true;   // SDO ack
+            if (buf[0]==0x80) return false;  // SDO abort
           }
         }
       }
@@ -95,12 +94,14 @@ RunState state = IDLE;
 void handleCommand(String cmd){
   cmd.trim(); cmd.toUpperCase();
 
+  // --- S: Fast enable ---
   if (cmd=="S"){
     if (enable_drive_fast()){ state=RUNNING; Serial.println(F("[OK] ENABLED (PP)")); }
     else                    { Serial.println(F("[WARN] Enable failed")); }
     return;
   }
 
+  // --- VEL/ACC/DEC: 프로파일 파라미터 변경 ---
   if (cmd.startsWith("VEL ")){
     long v = cmd.substring(4).toInt();
     if (v>0){ G_VEL=v; SDO_write_u32(0x6081,0x00,G_VEL,true); SDO_write_u32(0x607F,0x00,G_VEL*5,true); }
@@ -120,6 +121,7 @@ void handleCommand(String cmd){
     return;
   }
 
+  // --- ABS / 숫자만: 절대이동 ---
   if (cmd.startsWith("ABS ")){
     if (state!=RUNNING){ Serial.println(F("Send S first.")); return; }
     long t = cmd.substring(4).toInt();
@@ -129,7 +131,6 @@ void handleCommand(String cmd){
     Serial.print(F("ABS -> ")); Serial.println(t);
     return;
   }
-
   bool allDigitOrSign = cmd.length()>0;
   for(size_t i=0;i<cmd.length();++i){ char ch=cmd[i]; if(!(isDigit(ch)||ch=='-'||ch=='+')){allDigitOrSign=false;break;} }
   if(allDigitOrSign){
@@ -142,6 +143,7 @@ void handleCommand(String cmd){
     return;
   }
 
+  // --- REL: 상대이동 ---
   if (cmd.startsWith("REL ")){
     if (state!=RUNNING){ Serial.println(F("Send S first.")); return; }
     long inc = cmd.substring(4).toInt();
@@ -153,12 +155,13 @@ void handleCommand(String cmd){
   }
 }
 
+/* ========= Setup/Loop ========= */
 void setup(){
   Serial.begin(115200);
   pinMode(PIN_INT, INPUT);
 
-  // ⚠️ 여기 두 가지 수정: 상수명 + 세미콜론
-  byte ret = CAN.begin(DEFAULT_BAUD, MCP_16MHz);
+  byte ret = MCP2515_16MHZ ? CAN.begin(DEFAULT_BAUD, MCP_16MHZ)
+                           : CAN.begin(DEFAULT_BAUD, MCP_8MHZ);
   if (ret != CAN_OK){ Serial.println(F("CAN init failed")); while(1){} }
 
   CAN.setMode(MCP_NORMAL);
@@ -175,6 +178,7 @@ void loop(){
       if (buf.length()){ handleCommand(buf); buf=""; }
     } else {
       buf += c;
+      // 숫자는 즉시 ABS로
       bool allDigitOrSign = buf.length()>0;
       for(size_t i=0;i<buf.length();++i){ char ch=buf[i]; if(!(isDigit(ch)||ch=='-'||ch=='+')){allDigitOrSign=false;break;} }
       if (allDigitOrSign){ handleCommand(buf); buf=""; }
