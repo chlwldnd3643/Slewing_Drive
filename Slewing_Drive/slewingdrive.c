@@ -30,7 +30,7 @@ uint8_t  NODE_ID         = 1;            // 대상 Node-ID
 const bool MCP2515_16MHZ = true;         // MCP2515 크리스탈 (true=16MHz / false=8MHz)
 const uint8_t PIN_CS     = 9;
 const uint8_t PIN_INT    = 2;
-#define DEFAULT_BAUD      CAN_500KBPS    // 필요시 CAN_250KBPS 등
+#define DEFAULT_BAUD      CAN_250KBPS    // 필요시 CAN_250KBPS 등
 
 /* ===== Motion Profile (runtime 변경 가능) ===== */
 uint32_t G_VEL = 20000000;  // 0x6081 counts/s
