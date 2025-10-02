@@ -1,18 +1,34 @@
 #include <SPI.h>
 #include "mcp2515_can.h"
 
+/* ===== Compat ===== */
+#ifndef MCP_16MHZ
+  #ifdef MCP_16MHz
+    #define MCP_16MHZ MCP_16MHz
+  #endif
+#endif
+#ifndef MCP_16MHz
+  #ifdef MCP_16MHZ
+    #define MCP_16MHz MCP_16MHZ
+  #endif
+#endif
+#ifndef MCP_NORMAL
+  #define MCP_NORMAL 0x00
+#endif
+#ifndef CAN_OK
+  #define CAN_OK (0)
+#endif
+
 /* ===== User Config ===== */
-uint8_t  NODE_ID   = 1;     // 대상 Node-ID
+uint8_t  NODE_ID   = 1;
 const uint8_t PIN_CS  = 9;
 const uint8_t PIN_INT = 2;
 
-#define FIXED_BAUD  CAN_250KBPS   // 무조건 250kbps
-#define FIXED_CLK   MCP_16MHZ     // 무조건 16MHz
+#define FIXED_BAUD  CAN_250KBPS
+#define FIXED_CLK   MCP_16MHz
 
 /* ===== Profile ===== */
-uint32_t G_VEL = 20000000;  // counts/s
-uint32_t G_ACC = 366200;
-uint32_t G_DEC = 366200;
+long MAX_VEL = 30000000;   // ±30,000,000
 
 mcp2515_can CAN(PIN_CS);
 
@@ -20,10 +36,9 @@ mcp2515_can CAN(PIN_CS);
 bool sendCAN(uint32_t id, const uint8_t* data, uint8_t len=8){
   return CAN.sendMsgBuf(id, 0, len, (unsigned char*)data) == CAN_OK;
 }
-bool SDO_write_u32(uint16_t idx, uint8_t sub, uint32_t val){
-  uint8_t d[8]={0x23,(uint8_t)(idx&0xFF),(uint8_t)(idx>>8),sub,
-               (uint8_t)(val&0xFF),(uint8_t)((val>>8)&0xFF),
-               (uint8_t)((val>>16)&0xFF),(uint8_t)((val>>24)&0xFF)};
+bool SDO_write_u8(uint16_t idx, uint8_t sub, uint8_t val){
+  uint8_t d[8]={0x2F,(uint8_t)(idx&0xFF),(uint8_t)(idx>>8),sub,
+               val,0,0,0};
   return sendCAN(0x600+NODE_ID, d);
 }
 bool SDO_write_u16(uint16_t idx, uint8_t sub, uint16_t val){
@@ -32,51 +47,27 @@ bool SDO_write_u16(uint16_t idx, uint8_t sub, uint16_t val){
   return sendCAN(0x600+NODE_ID, d);
 }
 
-/* ===== Enable / Stop ===== */
+/* ===== PDO 송신 함수 ===== */
+// Target Velocity (obj 0x6042)는 표준적으로 32bit
+bool PDO_write_velocity(long vel){
+  uint8_t d[8];
+  d[0] = (uint8_t)(vel & 0xFF);
+  d[1] = (uint8_t)((vel>>8) & 0xFF);
+  d[2] = (uint8_t)((vel>>16)& 0xFF);
+  d[3] = (uint8_t)((vel>>24)& 0xFF);
+  d[4]=d[5]=d[6]=d[7]=0;   // 나머지 비움
+  return sendCAN(0x200+NODE_ID, d); // RPDO1 기본 COB-ID
+}
+
+/* ===== Enable ===== */
 bool enable_drive(){
-  // Profile Position 모드, accel/vel 세팅 후 enable 시퀀스
-  SDO_write_u32(0x6081,0x00,G_VEL);
-  SDO_write_u32(0x6083,0x00,G_ACC);
-  SDO_write_u32(0x6084,0x00,G_DEC);
+  // Velocity mode (0x6060=3)
+  SDO_write_u8(0x6060,0x00,0x03);
+
   delay(20);
   SDO_write_u16(0x6040,0x00,0x0086); // fault reset-ish
   delay(10);
-  return SDO_write_u16(0x6040,0x00,0x103F); // enable
-}
-void quick_stop(){
-  SDO_write_u16(0x6040,0x00,0x000B);
-}
-
-/* ===== Commands ===== */
-enum RunState { IDLE, RUNNING };
-RunState state = IDLE;
-
-void handleCommand(String cmd){
-  cmd.trim(); cmd.toUpperCase();
-
-  if (cmd=="S"){ if(enable_drive()){ state=RUNNING; Serial.println("ENABLED"); } return; }
-  if (cmd=="STOP"){ quick_stop(); state=IDLE; Serial.println("STOPPED"); return; }
-
-  if (cmd.startsWith("VEL ")){ G_VEL=cmd.substring(4).toInt(); SDO_write_u32(0x6081,0x00,G_VEL); Serial.println(G_VEL); return; }
-  if (cmd.startsWith("ACC ")){ G_ACC=cmd.substring(4).toInt(); SDO_write_u32(0x6083,0x00,G_ACC); Serial.println(G_ACC); return; }
-  if (cmd.startsWith("DEC ")){ G_DEC=cmd.substring(4).toInt(); SDO_write_u32(0x6084,0x00,G_DEC); Serial.println(G_DEC); return; }
-
-  if (cmd.startsWith("ABS ")){
-    if(state!=RUNNING){ Serial.println("Send S first."); return; }
-    long t = cmd.substring(4).toInt();
-    SDO_write_u32(0x607A,0x00,t);
-    uint16_t cw=0x001F; SDO_write_u16(0x6040,0x00,cw); cw&=~(1<<4); SDO_write_u16(0x6040,0x00,cw);
-    Serial.print("ABS->"); Serial.println(t);
-    return;
-  }
-  if (cmd.startsWith("REL ")){
-    if(state!=RUNNING){ Serial.println("Send S first."); return; }
-    long inc = cmd.substring(4).toInt();
-    SDO_write_u32(0x607A,0x00,inc);
-    uint16_t cw=0x005F; SDO_write_u16(0x6040,0x00,cw); cw&=~(1<<4); SDO_write_u16(0x6040,0x00,cw);
-    Serial.print("REL->"); Serial.println(inc);
-    return;
-  }
+  return SDO_write_u16(0x6040,0x00,0x000F); // Enable Operation
 }
 
 /* ===== Setup/Loop ===== */
@@ -85,19 +76,29 @@ void setup(){
   while(!Serial){}
   pinMode(PIN_INT, INPUT);
   pinMode(10, OUTPUT);
+  analogReference(DEFAULT);
 
-  byte ret = CAN.begin(FIXED_BAUD, FIXED_CLK);  // 무조건 250k, 16MHz
+  byte ret = CAN.begin(FIXED_BAUD, FIXED_CLK);
   if (ret != CAN_OK){ Serial.println("CAN init failed"); while(1){} }
   CAN.setMode(MCP_NORMAL);
 
-  Serial.println("READY: S | STOP | ABS | REL | VEL/ACC/DEC");
+  enable_drive();
+
+  Serial.println("READY: analog A0 → PDO Target Velocity ±30M");
 }
 
 void loop(){
-  static String buf;
-  while(Serial.available()){
-    char c=(char)Serial.read();
-    if(c=='\n'||c=='\r'){ if(buf.length()){ handleCommand(buf); buf=""; } }
-    else { buf+=c; }
+  int raw = analogRead(A0);        // 0~1023
+  float norm = (raw/1023.0f)*2.0f - 1.0f; // -1.0 ~ +1.0
+  long vel = (long)(norm * MAX_VEL);
+
+  PDO_write_velocity(vel);
+
+  static unsigned long last=0;
+  if(millis()-last>500){
+    Serial.print("A0="); Serial.print(raw);
+    Serial.print(" -> vel="); Serial.println(vel);
+    last=millis();
   }
+  delay(10); // PDO 전송 주기
 }
