@@ -44,7 +44,7 @@ const uint8_t LINK_RX_PIN = 8;
 const uint8_t LINK_TX_PIN = 9;   // 사용 안 해도 됨 (더미)
 SoftwareSerial linkSerial(LINK_RX_PIN, LINK_TX_PIN); // (RX, TX)
 
-int16_t steer_cmd = 0;          // -1000 ~ +1000
+long steer_cmd = 0;          // -1000 ~ +1000
 unsigned long lastSteerUpdate = 0;
 String steerLine = "";
 
@@ -287,15 +287,18 @@ void readSteerCommand() {
       if (steerLine.length() == 0) return;
 
       if (steerLine[0] == 'S') {
-        int val = steerLine.substring(1).toInt();
-        if (val >  1000) val =  1000;
-        if (val < -1000) val = -1000;
-        steer_cmd = (int16_t)val;
+        long val = steerLine.substring(1).toInt();  // "S-123456" → -123456
+
+        // 혹시라도 범위를 넘는 값이 오면 한 번 더 클램프
+        if (val >  2500000L) val =  2500000L;
+        if (val < -2500000L) val = -2500000L;
+
+        steer_cmd = val;
         lastSteerUpdate = millis();
       }
       steerLine = "";
     } else {
-      if (steerLine.length() < 16) {
+      if (steerLine.length() < 20) {
         steerLine += c;
       } else {
         steerLine = "";
@@ -303,6 +306,7 @@ void readSteerCommand() {
     }
   }
 }
+
 
 /* ===== Setup / Loop ===== */
 void setup() {
@@ -332,34 +336,29 @@ void setup() {
 }
 
 void loop() {
-  // 1) PC → 시리얼 명령 처리
+  // 1) 시리얼 명령 처리 (en, abs, rel, spd, 1/2/3 등)
   processSerial();
 
-  // 2) PDO 핸들 모드 / BOTH 모드일 때: 핸들 값을 PDO 포지션으로 전송
+  // 2) PDO 핸들 모드일 때만 핸들 값 사용
   if (controlMode == MODE_PDO_HANDLE || controlMode == MODE_BOTH_DEBUG) {
+
+    // 핸들 문자열 읽기
     readSteerCommand();
 
-    // 1초 이상 변화 없으면 중앙(0)으로
+    // 1초 이상 새 값이 없으면 0으로 (안전)
     if (millis() - lastSteerUpdate > 1000) {
       steer_cmd = 0;
     }
 
-    float norm = (float)steer_cmd / 1000.0f;   // -1.0 ~ +1.0
-    if (norm > -0.02f && norm < 0.02f) {
-      norm = 0.0f; // 약간의 데드존
-    }
+    long pos = steer_cmd;    // 이미 -2,500,000 ~ +2,500,000으로 스케일된 값
 
-    long pos = (long)(norm * (float)MAX_PDO_POS);  // -2.5M ~ +2.5M
-
+    // 바로 PDO로 Target Position 전송
     PDO_write_position(pos);
 
+    // 디버그 출력
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 200) {
-      Serial.print(F("[PDO] steer_cmd="));
-      Serial.print(steer_cmd);
-      Serial.print(F(" norm="));
-      Serial.print(norm, 3);
-      Serial.print(F(" pos="));
+      Serial.print("[PDO] steer_cmd(pos)=");
       Serial.println(pos);
       lastPrint = millis();
     }
