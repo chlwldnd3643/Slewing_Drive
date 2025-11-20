@@ -10,7 +10,7 @@
 #endif
 #ifndef MCP_16MHz
   #ifdef MCP_16MHZ
-    #define MCP_16MHZ MCP_16MHZ
+    #define MCP_16MHz MCP_16MHz
   #endif
 #endif
 #ifndef MCP_NORMAL
@@ -28,7 +28,7 @@ const uint8_t PIN_INT = 2;    // MCP2515 INT
 #define FIXED_BAUD  CAN_250KBPS
 #define FIXED_CLK   MCP_16MHz
 
-// Kinco FD1X5 Target speed 범위 (필요하면 조정)
+// Kinco FD1X5 Target speed 범위 (필요시 조정)
 long MAX_VEL = 30000000L;   // ±30,000,000
 
 mcp2515_can CAN(PIN_CS);
@@ -37,7 +37,7 @@ mcp2515_can CAN(PIN_CS);
    실제 배선: 핸들 보드 D8 → 이 보드 D8
 */
 const uint8_t LINK_RX_PIN = 8;  // RX (실제 사용 핀)
-const uint8_t LINK_TX_PIN = 9;  // 더미 TX (아무것도 안 연결해도 됨)
+const uint8_t LINK_TX_PIN = 9;  // 더미 TX (아무것도 안 연결)
 SoftwareSerial linkSerial(LINK_RX_PIN, LINK_TX_PIN); // (RX, TX)
 
 // 최신 핸들 명령 값(–1000 ~ +1000)
@@ -46,6 +46,15 @@ unsigned long lastSteerUpdate = 0;
 
 // 수신 버퍼
 String rxLine = "";
+
+/* ===== 제어 모드 ===== */
+enum ControlMode {
+  MODE_SDO_ONLY = 0,
+  MODE_PDO_ONLY = 1,
+  MODE_BOTH     = 2
+};
+
+ControlMode controlMode = MODE_SDO_ONLY; // 초기값: SDO만 사용
 
 /* ===== 기본 CAN 유틸 ===== */
 bool sendCAN(uint32_t id, const uint8_t* data, uint8_t len=8){
@@ -149,6 +158,33 @@ void readSteerCommand()
   }
 }
 
+/* ===== 시리얼 키로 제어 모드 전환 =====
+   '1' → SDO only
+   '2' → PDO only
+   '3' → BOTH
+*/
+void readModeKey()
+{
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '1') {
+      controlMode = MODE_SDO_ONLY;
+      Serial.println("[MODE] SDO only (0x60FF에 SDO로만 쓰기)");
+    } else if (c == '2') {
+      controlMode = MODE_PDO_ONLY;
+      Serial.println("[MODE] PDO only (0x200+ID RPDO1만 전송)");
+    } else if (c == '3') {
+      controlMode = MODE_BOTH;
+      Serial.println("[MODE] SDO + PDO 둘 다 전송");
+    } else if (c == 'h' || c == 'H') {
+      Serial.println("=== MODE HELP ===");
+      Serial.println("1 : SDO only  (0x60FF:00에만 SDO write)");
+      Serial.println("2 : PDO only  (0x200+NodeID RPDO1만 전송)");
+      Serial.println("3 : BOTH      (SDO + PDO 모두 전송)");
+    }
+  }
+}
+
 void setup(){
   Serial.begin(115200);
   while (!Serial) {}
@@ -172,19 +208,27 @@ void setup(){
     Serial.println("Drive Enabled.");
   }
 
-  Serial.println("Slewing Arduino READY. Receiving steering on D8, sending PDO+SDO.");
+  Serial.println("Slewing Arduino READY.");
+  Serial.println("Keyboard mode:");
+  Serial.println("  1 : SDO only");
+  Serial.println("  2 : PDO only");
+  Serial.println("  3 : BOTH (default=SDO only)");
+  Serial.println("  h : help");
 }
 
 void loop(){
-  // 1) 핸들 명령 수신
+  // 1) 제어 모드 전환 키 읽기
+  readModeKey();
+
+  // 2) 핸들 명령 수신
   readSteerCommand();
 
-  // 2) Fail-safe: 1초 이상 명령 없으면 0으로
+  // 3) Fail-safe: 1초 이상 명령 없으면 0으로
   if (millis() - lastSteerUpdate > 1000) {
     steer_cmd = 0;
   }
 
-  // 3) –1000 ~ +1000 → –1.0 ~ +1.0
+  // 4) –1000 ~ +1000 → –1.0 ~ +1.0
   float norm = (float)steer_cmd / 1000.0f;
 
   // Deadband: |norm| < 0.05 이면 0으로
@@ -192,19 +236,27 @@ void loop(){
     norm = 0.0f;
   }
 
-  // 4) Target speed 계산
+  // 5) Target speed 계산
   long vel = (long)(norm * (float)MAX_VEL);
 
-  // 5) 속도 명령 전송: SDO + PDO 둘 다 보냄
-  //    - SDO: 0x60FF:00 (Target speed) 직접 쓰기
-  //    - PDO: RPDO1 (0x200+NodeID) 로도 동일 값 송신
-  SDO_write_i32(0x60FF, 0x00, vel);
-  PDO_write_velocity(vel);
+  // 6) 선택된 모드에 따라 SDO/PDO 전송
+  if (controlMode == MODE_SDO_ONLY) {
+    SDO_write_i32(0x60FF, 0x00, vel);
+  } else if (controlMode == MODE_PDO_ONLY) {
+    PDO_write_velocity(vel);
+  } else { // MODE_BOTH
+    SDO_write_i32(0x60FF, 0x00, vel);
+    PDO_write_velocity(vel);
+  }
 
-  // 6) 디버그 출력
+  // 7) 디버그 출력
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 200) {
-    Serial.print("steer_cmd=");
+    Serial.print("[MODE=");
+    if (controlMode == MODE_SDO_ONLY)      Serial.print("SDO");
+    else if (controlMode == MODE_PDO_ONLY) Serial.print("PDO");
+    else                                   Serial.print("BOTH");
+    Serial.print("] steer_cmd=");
     Serial.print(steer_cmd);
     Serial.print("  norm=");
     Serial.print(norm, 3);
