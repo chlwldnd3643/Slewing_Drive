@@ -1,6 +1,6 @@
 #include <SPI.h>
 #include "mcp2515_can.h"
-#include <stdint.h>
+#include <SoftwareSerial.h>
 
 /* ===== Compat ===== */
 #ifndef MCP_16MHZ
@@ -10,7 +10,7 @@
 #endif
 #ifndef MCP_16MHz
   #ifdef MCP_16MHZ
-    #define MCP_16MHZ MCP_16MHz
+    #define MCP_16MHZ MCP_16MHZ
   #endif
 #endif
 #ifndef MCP_NORMAL
@@ -21,41 +21,50 @@
 #endif
 
 /* ===== User Config ===== */
-uint8_t  NODE_ID   = 1;     // 서보 드라이브 노드 ID
-const uint8_t PIN_CS  = 9;  // MCP2515 CS
-const uint8_t PIN_INT = 2;  // MCP2515 INT 핀
+uint8_t  NODE_ID   = 1;   // 드라이브 노드 ID
+const uint8_t PIN_CS  = 9;
+const uint8_t PIN_INT = 2;
 
 #define FIXED_BAUD  CAN_250KBPS
 #define FIXED_CLK   MCP_16MHz
 
-// Kinco 매뉴얼 Appendix II 참고 (encoder resolution = 65536)
-const uint32_t ENC_RES      = 65536UL;
-const long     SPD_MAX_RPM  = 3000;   // 안전상 적당히 제한
-const long     SPD_MIN_RPM  = 1;      // 0 이면 정지. 여기선 1rpm 이상만 허용
+// PDO 포지션 범위 (핸들 -1000~+1000 → -MAX_PDO_POS~+MAX_PDO_POS)
+const long MAX_PDO_POS = 2500000L;   // ±2,500,000 inc
 
-// PDO 속도 스케일 (기존 코드 유지)
-long MAX_VEL = 30000000L;   // ±30,000,000 (임의 스케일, 드라이브에서 상대 값으로 사용)
+// 포지션 속도 (position_speed = 0x6081) 기본값
+long g_positionSpeed = 1000L;        // 드라이브 내부 단위 그대로 사용
 
 mcp2515_can CAN(PIN_CS);
 
+/* ===== 핸들 수신 (별도 아두이노에서 D8으로 전송) =====
+   포맷 예: "S0\n", "S-500\n", "S1000\n"
+   연결: 핸들보드 TX(D8) → 이 보드 D8(RX)
+*/
+const uint8_t LINK_RX_PIN = 8;
+const uint8_t LINK_TX_PIN = 9;   // 사용 안 해도 됨 (더미)
+SoftwareSerial linkSerial(LINK_RX_PIN, LINK_TX_PIN); // (RX, TX)
+
+int16_t steer_cmd = 0;          // -1000 ~ +1000
+unsigned long lastSteerUpdate = 0;
+String steerLine = "";
+
 /* ===== 제어 모드 ===== */
 enum ControlMode {
-  MODE_SDO_POS = 0,    // SDO 포지션 모드 (ABS/REL)
-  MODE_PDO_VEL = 1     // PDO 속도 모드 (아날로그 A0 → 속도)
+  MODE_SDO_CMD    = 0,   // SDO: ABS/REL/SPD 만 사용
+  MODE_PDO_HANDLE = 1,   // 핸들 → PDO 포지션
+  MODE_BOTH_DEBUG = 2    // 둘 다 활성 (디버그)
 };
 
-ControlMode g_mode = MODE_SDO_POS;
+ControlMode controlMode = MODE_SDO_CMD;
 
-/* ===== 상태 변수 ===== */
-long g_cmdPosInc = 0;         // 우리가 관리하는 명령 위치 (inc 단위, 절대값)
-long g_speedRpm  = 1000;      // position speed / target speed 기본값 (rpm)
+/* ===== SDO용 상태 ===== */
+long g_targetPos = 0;     // 우리가 관리하는 SDO 기준 target position
 
-/* ===== 기본 유틸 ===== */
+/* ===== 공통 CAN/SDO 유틸 ===== */
 bool sendCAN(uint32_t id, const uint8_t* data, uint8_t len = 8) {
   return CAN.sendMsgBuf(id, 0, len, (unsigned char*)data) == CAN_OK;
 }
 
-// SDO write 8bit
 bool SDO_write_u8(uint16_t idx, uint8_t sub, uint8_t val) {
   uint8_t d[8] = {
     0x2F,
@@ -67,7 +76,6 @@ bool SDO_write_u8(uint16_t idx, uint8_t sub, uint8_t val) {
   return sendCAN(0x600 + NODE_ID, d);
 }
 
-// SDO write 16bit
 bool SDO_write_u16(uint16_t idx, uint8_t sub, uint16_t val) {
   uint8_t d[8] = {
     0x2B,
@@ -81,7 +89,6 @@ bool SDO_write_u16(uint16_t idx, uint8_t sub, uint16_t val) {
   return sendCAN(0x600 + NODE_ID, d);
 }
 
-// SDO write 32bit
 bool SDO_write_u32(uint16_t idx, uint8_t sub, uint32_t val) {
   uint8_t d[8] = {
     0x23,
@@ -96,217 +103,204 @@ bool SDO_write_u32(uint16_t idx, uint8_t sub, uint32_t val) {
   return sendCAN(0x600 + NODE_ID, d);
 }
 
-/* ===== rpm → 내부 DEC 변환 (매뉴얼 Appendix II 공식 사용) =====
- * DEC = (RPM * 512 * encoder_resolution) / 1875
- * encoder_resolution = 65536 으로 가정 (매뉴얼 Note 기준)
- */
-uint32_t rpm_to_dec(long rpm) {
-  if (rpm < 0) rpm = -rpm;
-
-  long long num = (long long)rpm * 512LL * (long long)ENC_RES;
-  long long dec = num / 1875LL;
-
-  if (dec < 0) dec = 0;
-  if (dec > 0xFFFFFFFFLL) dec = 0xFFFFFFFFLL;
-  return (uint32_t)dec;
+bool SDO_write_i32(uint16_t idx, uint8_t sub, int32_t val) {
+  return SDO_write_u32(idx, sub, (uint32_t)val);
 }
 
-/* ===== PDO : Target Velocity (0x200 + NODE_ID) ===== */
-// 주의: 여기 vel 값은 rpm이 아니라, 드라이브 내부 스케일과 맞춘 "임의 단위" 그대로.
-bool PDO_write_velocity(long vel) {
+/* ===== PDO: Target Position 송신 (RPDO1 = 0x200 + NODE_ID, 607A 매핑 가정) ===== */
+bool PDO_write_position(long pos) {
   uint8_t d[8];
-  d[0] = (uint8_t)(vel & 0xFF);
-  d[1] = (uint8_t)((vel >> 8) & 0xFF);
-  d[2] = (uint8_t)((vel >> 16) & 0xFF);
-  d[3] = (uint8_t)((vel >> 24) & 0xFF);
+  d[0] = (uint8_t)( pos        & 0xFF);
+  d[1] = (uint8_t)((pos >> 8 ) & 0xFF);
+  d[2] = (uint8_t)((pos >> 16) & 0xFF);
+  d[3] = (uint8_t)((pos >> 24) & 0xFF);
   d[4] = d[5] = d[6] = d[7] = 0;
-
-  return sendCAN(0x200 + NODE_ID, d);  // RPDO1 기본 COB-ID
+  return sendCAN(0x200 + NODE_ID, d);
 }
 
-/* ===== 속도 설정 (position_speed + target_speed 동시 설정) =====
- * SPD <rpm> 명령에서 사용.
- * - 포지션 모드: 0x6081 Trapezoidal velocity (position speed)
- * - 속도 모드:   0x60FF Target speed
- */
-void setSpeedRpm(long rpm) {
-  if (rpm < 0) rpm = -rpm;
-  if (rpm == 0) {
-    // 0 을 주면 정지, 원하면 허용해도 되지만 여기선 최소 1rpm 이상으로 제한
-    rpm = SPD_MIN_RPM;
-  }
-  if (rpm > SPD_MAX_RPM) rpm = SPD_MAX_RPM;
+/* ===== position_speed 설정 (0x6081) ===== */
+void set_position_speed(long spd) {
+  if (spd < 0) spd = -spd;
+  if (spd == 0) spd = 1;   // 0 방지
 
-  g_speedRpm = rpm;
+  g_positionSpeed = spd;
+  SDO_write_u32(0x6081, 0x00, (uint32_t)g_positionSpeed);
 
-  uint32_t dec = rpm_to_dec(rpm);
-
-  // 포지션 모드용 position_speed (Trapezoidal velocity)
-  SDO_write_u32(0x6081, 0x00, dec);
-
-  // 속도 모드용 Target speed (-3 / 3 모드에서 사용)
-  SDO_write_u32(0x60FF, 0x00, dec);
-
-  Serial.print(F("[SPD] rpm="));
-  Serial.print(rpm);
-  Serial.print(F(" -> DEC="));
-  Serial.println(dec);
+  Serial.print(F("[SPD] position_speed(0x6081) = "));
+  Serial.println(g_positionSpeed);
 }
 
-/* ===== 모드 설정 ===== */
+/* ===== 드라이브 Enable (Position Mode + 103F) ===== */
+bool enable_drive() {
+  bool ok = true;
 
-// SDO 포지션 모드 (ABS/REL)
-void configure_mode_sdo_position() {
-  g_mode = MODE_SDO_POS;
-
-  // Error reset
-  SDO_write_u16(0x6040, 0x00, 0x0086);
+  // 1) Fault reset (0x86)
+  ok &= SDO_write_u16(0x6040, 0x00, 0x0086);
   delay(20);
 
-  // Position mode (1)
-  SDO_write_u8(0x6060, 0x00, 1);
+  // 2) Mode of operation = 1 (Profile Position Mode)
+  ok &= SDO_write_u8(0x6060, 0x00, 0x01);
   delay(20);
 
-  // 기본 position speed 설정
-  setSpeedRpm(g_speedRpm);
+  // 3) position_speed 설정 (0x6081)
+  set_position_speed(g_positionSpeed);
+  delay(20);
 
-  Serial.println(F("[MODE] SDO Position mode (ABS/REL)"));
+  // 4) Controlword = 0x103F (Target position 바뀔 때마다 즉시 절대 위치로 이동)
+  ok &= SDO_write_u16(0x6040, 0x00, 0x103F);
+  delay(20);
+
+  return ok;
 }
 
-// PDO 속도 모드 (아날로그 입력 → 속도)
-void configure_mode_pdo_velocity() {
-  g_mode = MODE_PDO_VEL;
-
-  // Error reset
-  SDO_write_u16(0x6040, 0x00, 0x0086);
-  delay(20);
-
-  // Speed mode with position loop (3) 또는 -3 (즉시 속도)
-  SDO_write_u8(0x6060, 0x00, 3);   // 필요시 -3 으로 변경 가능
-  delay(20);
-
-  // Enable operation (표준 DS402 스타일로 한 번 Enable)
-  SDO_write_u16(0x6040, 0x00, 0x0006); // Switch on disabled → ready
-  delay(10);
-  SDO_write_u16(0x6040, 0x00, 0x000F); // Enable operation
-  delay(10);
-
-  // 속도모드용 target_speed도 갱신
-  setSpeedRpm(g_speedRpm);
-
-  Serial.println(F("[MODE] PDO Velocity mode (A0 → Target Velocity)"));
-}
-
-/* ===== 포지션 명령 (SDO) ===== */
-
-// 내부 g_cmdPosInc 를 드라이브에 쓰고, 즉시 이동 트리거
-bool sdo_send_position(long posInc) {
-  g_cmdPosInc = posInc;
-
-  // Target position (0x607A)
-  if (!SDO_write_u32(0x607A, 0x00, (uint32_t)g_cmdPosInc)) {
-    Serial.println(F("[ERR] SDO write 0x607A failed"));
-    return false;
-  }
+/* ===== SDO 포지션 명령 (ABS / REL) ===== */
+void sdo_move_abs(long pos) {
+  g_targetPos = pos;
+  SDO_write_i32(0x607A, 0x00, g_targetPos);   // 103F 상태에서는 이거 바꾸면 바로 이동
   delay(5);
 
-  // 0x103F: "Immediate absolute positioning as target position changes"
-  if (!SDO_write_u16(0x6040, 0x00, 0x103F)) {
-    Serial.println(F("[ERR] SDO write 0x6040=0x103F failed"));
-    return false;
-  }
-
-  Serial.print(F("[MOVE] ABS pos="));
-  Serial.println(g_cmdPosInc);
-  return true;
+  Serial.print(F("[SDO ABS] targetPos = "));
+  Serial.println(g_targetPos);
 }
 
-// ABS 명령: 절대 위치로 이동
-void cmd_abs(long posInc) {
-  sdo_send_position(posInc);
+void sdo_move_rel(long delta) {
+  g_targetPos += delta;
+  sdo_move_abs(g_targetPos);
 }
 
-// REL 명령: 현재 위치에서 상대 이동 (우리는 내부에서 절대값으로 변환)
-void cmd_rel(long deltaInc) {
-  long newPos = g_cmdPosInc + deltaInc;
-  sdo_send_position(newPos);
-}
+/* ===== 시리얼 명령 처리 =====
+   명령:
+     en          : enable_drive()
+     rst         : 0x6040 = 0x0086
+     abs 3000    : 절대 위치 3000 inc
+     rel 2000    : 상대 +2000 inc
+     spd 1000    : position_speed(0x6081) = 1000
+     1           : MODE_SDO_CMD
+     2           : MODE_PDO_HANDLE
+     3           : MODE_BOTH_DEBUG
+     h / help    : 도움말
+*/
+String serialLine = "";
 
-/* ===== 시리얼 명령 파서 =====
- * 지원 명령:
- *  - ABS <pos>   : 절대 위치 (inc)
- *  - REL <delta> : 상대 이동 (inc)
- *  - SPD <rpm>   : position speed / target speed 설정
- *  - MODE SDO    : SDO 포지션 모드
- *  - MODE PDO    : PDO 속도 모드
- *  - HELP        : 도움말
- */
-void handleSerial() {
-  static char buf[40];
+void processSerial() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\r') continue;
 
-  if (!Serial.available()) return;
+    if (c == '\n') {
+      if (serialLine.length() == 0) return;
 
-  size_t n = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
-  if (n == 0) return;
-  buf[n] = '\0';
+      String line = serialLine;
+      serialLine = "";
 
-  // 공백 스킵
-  char *p = buf;
-  while (*p == ' ' || *p == '\t') p++;
+      line.trim();
+      line.toLowerCase();
 
-  if (strncmp(p, "ABS", 3) == 0) {
-    long v = 0;
-    if (sscanf(p + 3, "%ld", &v) == 1) {
-      cmd_abs(v);
-    } else {
-      Serial.println(F("Usage: ABS <pos_inc>"));
-    }
-  }
-  else if (strncmp(p, "REL", 3) == 0) {
-    long v = 0;
-    if (sscanf(p + 3, "%ld", &v) == 1) {
-      cmd_rel(v);
-    } else {
-      Serial.println(F("Usage: REL <delta_inc>"));
-    }
-  }
-  else if (strncmp(p, "SPD", 3) == 0) {
-    long rpm = 0;
-    if (sscanf(p + 3, "%ld", &rpm) == 1) {
-      setSpeedRpm(rpm);
-    } else {
-      Serial.print(F("[SPD] current rpm="));
-      Serial.println(g_speedRpm);
-      Serial.println(F("Usage: SPD <rpm>"));
-    }
-  }
-  else if (strncmp(p, "MODE", 4) == 0) {
-    // MODE 뒤 두 번째 토큰
-    char m[8] = {0};
-    if (sscanf(p + 4, "%7s", m) == 1) {
-      if (strcmp(m, "SDO") == 0) {
-        configure_mode_sdo_position();
-      } else if (strcmp(m, "PDO") == 0) {
-        configure_mode_pdo_velocity();
-      } else {
-        Serial.println(F("Usage: MODE SDO | MODE PDO"));
+      // 모드 전환
+      if (line == "1") {
+        controlMode = MODE_SDO_CMD;
+        Serial.println(F("[MODE] SDO_CMD (ABS/REL/SPD)"));
+        return;
       }
+      if (line == "2") {
+        controlMode = MODE_PDO_HANDLE;
+        Serial.println(F("[MODE] PDO_HANDLE (steering → position PDO)"));
+        return;
+      }
+      if (line == "3") {
+        controlMode = MODE_BOTH_DEBUG;
+        Serial.println(F("[MODE] BOTH (SDO + PDO)"));
+        return;
+      }
+      if (line == "h" || line == "help") {
+        Serial.println(F("=== HELP ==="));
+        Serial.println(F(" en          : enable (pos mode + 6081 + 0x103F)"));
+        Serial.println(F(" rst         : 0x6040 = 0x0086 (fault reset)"));
+        Serial.println(F(" abs <pos>   : absolute position (inc) via SDO"));
+        Serial.println(F(" rel <delta> : relative move (inc) via SDO"));
+        Serial.println(F(" spd <val>   : position_speed(0x6081) = val"));
+        Serial.println(F(" 1           : MODE_SDO_CMD"));
+        Serial.println(F(" 2           : MODE_PDO_HANDLE"));
+        Serial.println(F(" 3           : MODE_BOTH_DEBUG"));
+        return;
+      }
+
+      // enable / reset
+      if (line == "en") {
+        bool ok = enable_drive();
+        Serial.println(ok ? F("[EN] OK") : F("[EN] FAIL"));
+        return;
+      }
+      if (line == "rst") {
+        bool ok = SDO_write_u16(0x6040, 0x00, 0x0086);
+        Serial.println(ok ? F("[RST] 0x86 OK") : F("[RST] FAIL"));
+        return;
+      }
+
+      // spd
+      if (line.startsWith("spd")) {
+        String s = line.substring(3);
+        s.trim();
+        long v = s.toInt();
+        set_position_speed(v);
+        return;
+      }
+
+      // abs / rel (SDO 모드 또는 BOTH일 때 의미 있음)
+      if (controlMode == MODE_SDO_CMD || controlMode == MODE_BOTH_DEBUG) {
+        if (line.startsWith("abs")) {
+          String s = line.substring(3);
+          s.trim();
+          long p = s.toInt();
+          sdo_move_abs(p);
+          return;
+        }
+        if (line.startsWith("rel")) {
+          String s = line.substring(3);
+          s.trim();
+          long d = s.toInt();
+          sdo_move_rel(d);
+          return;
+        }
+      }
+
+      Serial.print(F("[WARN] Unknown cmd: "));
+      Serial.println(line);
+      return;
     } else {
-      Serial.println(F("Usage: MODE SDO | MODE PDO"));
+      if (serialLine.length() < 64) {
+        serialLine += c;
+      } else {
+        serialLine = "";
+      }
     }
   }
-  else if (strncmp(p, "HELP", 4) == 0) {
-    Serial.println(F("Commands:"));
-    Serial.println(F("  ABS <pos_inc>   : move to absolute position (inc)"));
-    Serial.println(F("  REL <delta_inc> : move relative (inc)"));
-    Serial.println(F("  SPD <rpm>       : set position_speed / target_speed (rpm)"));
-    Serial.println(F("  MODE SDO        : SDO position mode (ABS/REL)"));
-    Serial.println(F("  MODE PDO        : PDO velocity mode (A0 -> Target Velocity)"));
-  }
-  else {
-    Serial.print(F("Unknown cmd: "));
-    Serial.println(p);
-    Serial.println(F("Type HELP for list."));
+}
+
+/* ===== 핸들 명령 수신 (S-500, S0, S1000 등) ===== */
+void readSteerCommand() {
+  while (linkSerial.available() > 0) {
+    char c = linkSerial.read();
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      if (steerLine.length() == 0) return;
+
+      if (steerLine[0] == 'S') {
+        int val = steerLine.substring(1).toInt();
+        if (val >  1000) val =  1000;
+        if (val < -1000) val = -1000;
+        steer_cmd = (int16_t)val;
+        lastSteerUpdate = millis();
+      }
+      steerLine = "";
+    } else {
+      if (steerLine.length() < 16) {
+        steerLine += c;
+      } else {
+        steerLine = "";
+      }
+    }
   }
 }
 
@@ -316,8 +310,9 @@ void setup() {
   while (!Serial) {}
 
   pinMode(PIN_INT, INPUT);
-  pinMode(10, OUTPUT);        // MCP2515 라이브러리 예제 호환용
-  analogReference(DEFAULT);
+  pinMode(10, OUTPUT);   // SPI용 SS (일반적으로 LOW 유지)
+
+  linkSerial.begin(57600);   // 핸들 아두이노와 동일 속도
 
   byte ret = CAN.begin(FIXED_BAUD, FIXED_CLK);
   if (ret != CAN_OK) {
@@ -326,35 +321,49 @@ void setup() {
   }
   CAN.setMode(MCP_NORMAL);
 
-  Serial.println(F("Kinco FD1x5 / iSMK Control via CANopen"));
-  Serial.println(F("Commands: ABS, REL, SPD, MODE SDO/PDO, HELP"));
+  Serial.println(F("=== Kinco FD1x5 Slewing Controller ==="));
+  Serial.println(F(" 먼저 'en' 한 번 쳐서 pos mode + 6081 + 0x103F 상태 만들어 놓고:"));
+  Serial.println(F("  - SDO 제어: abs/rel/spd"));
+  Serial.println(F("  - PDO 제어: MODE 2 선택 후 핸들 돌리기"));
+  Serial.println(F(" 명령: en, rst, abs, rel, spd, 1/2/3, h/help"));
 
-  // 기본은 SDO 포지션 모드로 시작
-  configure_mode_sdo_position();
+  // 시작은 SDO 모드로
+  controlMode = MODE_SDO_CMD;
 }
 
 void loop() {
-  // 시리얼 명령 처리
-  handleSerial();
+  // 1) PC → 시리얼 명령 처리
+  processSerial();
 
-  // PDO 속도 모드일 때만 A0 → PDO 전송
-  if (g_mode == MODE_PDO_VEL) {
-    int raw = analogRead(A0);                       // 0~1023
-    float norm = (raw / 1023.0f) * 2.0f - 1.0f;     // -1.0 ~ +1.0
-    long vel = (long)(norm * MAX_VEL);
+  // 2) PDO 핸들 모드 / BOTH 모드일 때: 핸들 값을 PDO 포지션으로 전송
+  if (controlMode == MODE_PDO_HANDLE || controlMode == MODE_BOTH_DEBUG) {
+    readSteerCommand();
 
-    PDO_write_velocity(vel);
+    // 1초 이상 변화 없으면 중앙(0)으로
+    if (millis() - lastSteerUpdate > 1000) {
+      steer_cmd = 0;
+    }
+
+    float norm = (float)steer_cmd / 1000.0f;   // -1.0 ~ +1.0
+    if (norm > -0.02f && norm < 0.02f) {
+      norm = 0.0f; // 약간의 데드존
+    }
+
+    long pos = (long)(norm * (float)MAX_PDO_POS);  // -2.5M ~ +2.5M
+
+    PDO_write_position(pos);
 
     static unsigned long lastPrint = 0;
-    if (millis() - lastPrint > 500) {
-      Serial.print(F("[PDO] A0=")); Serial.print(raw);
-      Serial.print(F(" -> vel=")); Serial.println(vel);
+    if (millis() - lastPrint > 200) {
+      Serial.print(F("[PDO] steer_cmd="));
+      Serial.print(steer_cmd);
+      Serial.print(F(" norm="));
+      Serial.print(norm, 3);
+      Serial.print(F(" pos="));
+      Serial.println(pos);
       lastPrint = millis();
     }
-    delay(10);
   }
-  else {
-    // SDO 포지션 모드에서는 루프에서 할 일 없음 (명령은 시리얼로만)
-    delay(5);
-  }
+
+  delay(10);
 }
