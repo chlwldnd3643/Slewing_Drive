@@ -10,7 +10,7 @@
 #endif
 #ifndef MCP_16MHz
   #ifdef MCP_16MHZ
-    #define MCP_16MHz MCP_16MHz
+    #define MCP_16MHZ MCP_16MHz
   #endif
 #endif
 #ifndef MCP_NORMAL
@@ -28,36 +28,40 @@ const uint8_t PIN_INT = 2;    // MCP2515 INT
 #define FIXED_BAUD  CAN_250KBPS
 #define FIXED_CLK   MCP_16MHz
 
-// 슬루잉 모터 목표 위치 범위 (절대 펄스 단위, 기어비 / 엔코더 해상도에 맞게 조정)
-long MAX_POS = 200000L;   // 중앙 기준 ±200,000 펄스 예시
+// 핸들 → PDO 모드에서 쓸 최대 위치 (중앙 기준 ±MAX_POS)
+long MAX_POS = 200000L;   // 기어비/엔코더에 맞게 조정
 
 mcp2515_can CAN(PIN_CS);
 
 /* ===== 핸들 명령 수신용 SoftwareSerial =====
    실제 배선: 핸들 보드 D8 → 이 보드 D8
 */
-const uint8_t LINK_RX_PIN = 8;  // RX (실제 사용 핀)
-const uint8_t LINK_TX_PIN = 9;  // 더미 TX (아무것도 안 연결)
+const uint8_t LINK_RX_PIN = 8;  // RX
+const uint8_t LINK_TX_PIN = 9;  // 더미 TX
 SoftwareSerial linkSerial(LINK_RX_PIN, LINK_TX_PIN); // (RX, TX)
 
 // 최신 핸들 명령 값(–1000 ~ +1000)
 int16_t steer_cmd = 0;
 unsigned long lastSteerUpdate = 0;
 
-// 수신 버퍼
-String rxLine = "";
+// 시리얼 명령/핸들 수신 버퍼
+String serialLine = "";
+String steerLine  = "";
 
 /* ===== 제어 모드 ===== */
 enum ControlMode {
-  MODE_SDO_ONLY = 0,
-  MODE_PDO_ONLY = 1,
-  MODE_BOTH     = 2
+  MODE_SDO_CMD   = 0,   // ABS 3000, REL 2000 같은 SDO 명령 모드
+  MODE_PDO_HANDLE = 1,  // 핸들 → PDO 실시간 포지션
+  MODE_BOTH_DEBUG = 2
 };
 
-ControlMode controlMode = MODE_SDO_ONLY; // 기본: SDO만 사용
+ControlMode controlMode = MODE_SDO_CMD; // 기본: SDO 명령 모드
 
-// Position mode에서 New set-point bit(6040 bit4) 토글용
+// Position mode에서 New set-point(bit4) 토글용
 bool toggleNewSetpoint = false;
+
+// 내부에서 기억하는 "지금까지 보낸 절대 위치"
+long currentPos = 0;
 
 /* ===== 기본 CAN 유틸 ===== */
 bool sendCAN(uint32_t id, const uint8_t* data, uint8_t len=8){
@@ -103,9 +107,9 @@ bool SDO_write_i32(uint16_t idx, uint8_t sub, int32_t val){
   return sendCAN(0x600 + NODE_ID, d);
 }
 
-/* ===== PDO: Target Position 송신 함수 =====
+/* ===== PDO: Target Position 송신 =====
    RPDO1: COB-ID = 0x200 + NODE_ID 에
-   4바이트 Target Position(0x607A)을 매핑했다고 가정
+   4바이트 Target Position(0x607A)이 매핑되어 있다고 가정
 */
 bool PDO_write_position(long pos){
   uint8_t d[8];
@@ -117,106 +121,184 @@ bool PDO_write_position(long pos){
   return sendCAN(0x200 + NODE_ID, d); // RPDO1 COB-ID
 }
 
-/* ===== Drive Enable (Profile Position Mode, ABS) ===== */
+/* ===== Drive Enable (Profile Position Mode) ===== */
 bool enable_drive(){
   // 1) Mode of operation = 1 (Profile Position)
   SDO_write_u8(0x6060, 0x00, 0x01);
   delay(20);
 
-  // 2) Fault reset-ish (기존에 쓰던 0x0086 유지)
+  // 2) Fault reset-ish
   SDO_write_u16(0x6040, 0x00, 0x0086);
   delay(10);
 
-  // 3) Enable operation (bit0~3 = 1111)
+  // 3) Enable operation
   return SDO_write_u16(0x6040, 0x00, 0x000F);
 }
 
-/* ===== 핸들 명령 수신 파싱 =====
-   포맷: "S<정수>\n"  예) S0, S-523, S1000
+/* ===== Position 명령 공통 함수 =====
+   isRelative = false → ABS pos, true → REL delta
+   useSDO     = true  → 0x607A에 SDO write
+   usePDO     = true  → RPDO1로 Target Position 전송
 */
+void send_position_core(bool isRelative, long value, bool useSDO, bool usePDO)
+{
+  if (useSDO) {
+    // ABS면 0x607A에 최종 위치, REL이면 이동량
+    SDO_write_i32(0x607A, 0x00, value);
+  }
+
+  if (usePDO) {
+    PDO_write_position(value);
+  }
+
+  // Controlword 구성
+  uint16_t cw = 0x000F;        // enable operation 유지
+  cw |= (1 << 5);              // bit5 = 1: change set immediately
+
+  if (isRelative) {
+    cw |= (1 << 6);            // bit6 = 1: relative
+  } else {
+    // ABS: bit6 = 0
+  }
+
+  if (toggleNewSetpoint) {
+    cw |= (1 << 4);            // bit4 = 1: new set-point
+  }
+  toggleNewSetpoint = !toggleNewSetpoint;
+
+  SDO_write_u16(0x6040, 0x00, cw);
+}
+
+/* ===== SDO ABS/REL 전용 래퍼 ===== */
+void sdo_move_abs(long pos){
+  currentPos = pos;
+  send_position_core(false, pos, true, false); // ABS, SDO만
+}
+
+void sdo_move_rel(long delta){
+  currentPos += delta;
+  send_position_core(true, delta, true, false); // REL, SDO만 (value=delta)
+}
+
+/* ===== PDO 핸들용 ABS 포지션 ===== */
+void pdo_move_abs(long pos){
+  currentPos = pos;
+  send_position_core(false, pos, false, true); // ABS, PDO만
+}
+
+/* ===== 시리얼(USB) 한 줄 읽기: 모드 + SDO 명령 =====
+   예:
+     "1"           → 모드 SDO_CMD
+     "2"           → 모드 PDO_HANDLE
+     "3"           → BOTH_DEBUG
+     "ABS 3000"    → 절대 위치 3000으로 이동 (SDO)
+     "REL 2000"    → 현재 위치 기준 +2000 (SDO)
+     "REL -1000"   → 현재 위치 기준 -1000 (SDO)
+*/
+void processSerialLine()
+{
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      if (serialLine.length() == 0) return;
+
+      String line = serialLine;
+      serialLine = "";
+
+      line.trim();
+      line.toUpperCase();
+
+      // 모드 전환
+      if (line == "1") {
+        controlMode = MODE_SDO_CMD;
+        Serial.println("[MODE] SDO CMD (ABS/REL via SDO)");
+        return;
+      }
+      if (line == "2") {
+        controlMode = MODE_PDO_HANDLE;
+        Serial.println("[MODE] PDO HANDLE (steering → position)");
+        return;
+      }
+      if (line == "3") {
+        controlMode = MODE_BOTH_DEBUG;
+        Serial.println("[MODE] BOTH DEBUG (SDO CMD + PDO HANDLE)");
+        return;
+      }
+      if (line == "H" || line == "HELP") {
+        Serial.println("=== HELP ===");
+        Serial.println("1         : SDO CMD mode (ABS/REL via SDO)");
+        Serial.println("2         : PDO HANDLE mode (steering → PDO pos)");
+        Serial.println("3         : BOTH (debug)");
+        Serial.println("ABS 3000  : absolute move to 3000 (SDO)");
+        Serial.println("REL 2000  : relative move +2000 (SDO)");
+        Serial.println("REL -1000 : relative move -1000 (SDO)");
+        return;
+      }
+
+      // SDO ABS/REL 명령 (SDO CMD 모드 또는 BOTH에서만 처리)
+      if (controlMode == MODE_SDO_CMD || controlMode == MODE_BOTH_DEBUG) {
+        if (line.startsWith("ABS")) {
+          line.remove(0, 3);
+          line.trim();
+          long val = line.toInt();
+          sdo_move_abs(val);
+          Serial.print("[SDO ABS] target = ");
+          Serial.println(val);
+          return;
+        }
+        if (line.startsWith("REL")) {
+          line.remove(0, 3);
+          line.trim();
+          long delta = line.toInt();
+          sdo_move_rel(delta);
+          Serial.print("[SDO REL] delta = ");
+          Serial.print(delta);
+          Serial.print("  currentPos = ");
+          Serial.println(currentPos);
+          return;
+        }
+      }
+
+      // 그 외 문자열은 무시
+      return;
+    } else {
+      if (serialLine.length() < 64) {
+        serialLine += c;
+      } else {
+        serialLine = "";
+      }
+    }
+  }
+}
+
+/* ===== 핸들 보드에서 들어오는 명령 파싱 (S-500, S1000 등) ===== */
 void readSteerCommand()
 {
   while (linkSerial.available() > 0) {
     char c = linkSerial.read();
-    if (c == '\r') continue; // CR 무시
+    if (c == '\r') continue;
 
     if (c == '\n') {
-      // 한 줄 완성
-      if (rxLine.length() > 0 && rxLine[0] == 'S') {
-        // "S-523" 형식
-        int val = rxLine.substring(1).toInt(); // 부호 포함 정수
+      if (steerLine.length() == 0) return;
+
+      if (steerLine[0] == 'S') {
+        int val = steerLine.substring(1).toInt();
         if (val >  1000) val =  1000;
         if (val < -1000) val = -1000;
         steer_cmd = (int16_t)val;
         lastSteerUpdate = millis();
       }
-      rxLine = "";
+      steerLine = "";
     } else {
-      if (rxLine.length() < 16) {
-        rxLine += c;
+      if (steerLine.length() < 16) {
+        steerLine += c;
       } else {
-        rxLine = ""; // 너무 길면 버림
+        steerLine = "";
       }
     }
   }
-}
-
-/* ===== 시리얼 키로 제어 모드 전환 =====
-   '1' → SDO only (607A에 SDO로만 쓰기)
-   '2' → PDO only (0x200+ID RPDO1만 전송)
-   '3' → BOTH
-*/
-void readModeKey()
-{
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    if (c == '1') {
-      controlMode = MODE_SDO_ONLY;
-      Serial.println("[MODE] SDO only (0x607A SDO write)");
-    } else if (c == '2') {
-      controlMode = MODE_PDO_ONLY;
-      Serial.println("[MODE] PDO only (0x200+ID RPDO1)");
-    } else if (c == '3') {
-      controlMode = MODE_BOTH;
-      Serial.println("[MODE] SDO + PDO 둘 다 사용");
-    } else if (c == 'h' || c == 'H') {
-      Serial.println("=== MODE HELP ===");
-      Serial.println("1 : SDO only  (0x607A:00에 SDO write)");
-      Serial.println("2 : PDO only  (0x200+NodeID RPDO1만 사용)");
-      Serial.println("3 : BOTH      (SDO + PDO 모두 전송)");
-    }
-  }
-}
-
-/* ===== ABS Position 명령 전송 (Profile Position Mode) =====
-   - pos: 목표 위치(절대 값, 펄스 단위)
-   - SDO: 0x607A:00 에 Target position 설정
-   - PDO: RPDO1로 Target position 전송 (매핑되어 있을 때)
-   - Controlword(0x6040)의 bit4(New set-point)를 토글해서 세트포인트 래치
-   - bit5(Change set immediately)=1, bit6(Relative/Absolute)=0(ABS)
-*/
-void send_position_command(long pos)
-{
-  // 1) 선택된 경로로 Target Position 전송
-  if (controlMode == MODE_SDO_ONLY || controlMode == MODE_BOTH) {
-    SDO_write_i32(0x607A, 0x00, pos);   // Target position (ABS)
-  }
-  if (controlMode == MODE_PDO_ONLY || controlMode == MODE_BOTH) {
-    PDO_write_position(pos);           // RPDO1로 Target position
-  }
-
-  // 2) Controlword 업데이트 (ABS, change immediately, new set-point 토글)
-  uint16_t cw = 0x000F;        // enable operation 상태 유지 (bit0~3=1)
-  cw |= (1 << 5);              // bit5 = 1: change set immediately
-  // bit6 = 0: absolute mode (REL 쓰려면 여기 1로 바꾸면 됨)
-
-  if (toggleNewSetpoint) {
-    cw |= (1 << 4);            // bit4 = 1
-  }
-  // 다음 호출에서 bit4 토글
-  toggleNewSetpoint = !toggleNewSetpoint;
-
-  SDO_write_u16(0x6040, 0x00, cw);
 }
 
 void setup(){
@@ -224,10 +306,10 @@ void setup(){
   while (!Serial) {}
 
   pinMode(PIN_INT, INPUT);
-  pinMode(10, OUTPUT);   // SS 핀: SPI 마스터 유지용
+  pinMode(10, OUTPUT);   // SS: SPI 마스터 유지용
   analogReference(DEFAULT);
 
-  linkSerial.begin(57600);   // 핸들 보드와 동일 속도
+  linkSerial.begin(57600);   // 핸들 보드와 동일
 
   byte ret = CAN.begin(FIXED_BAUD, FIXED_CLK);
   if (ret != CAN_OK){
@@ -239,58 +321,54 @@ void setup(){
   if(!enable_drive()){
     Serial.println("Drive enable failed");
   } else {
-    Serial.println("Drive Enabled (Profile Position Mode, ABS).");
+    Serial.println("Drive Enabled (Profile Position Mode).");
   }
 
+  currentPos = 0;
+  sdo_move_abs(0);   // 초기 위치 0으로 한번 맞추기
+
   Serial.println("Slewing Arduino READY (Position Mode).");
-  Serial.println("Keyboard mode:");
-  Serial.println("  1 : SDO only (0x607A SDO)");
-  Serial.println("  2 : PDO only (0x200+ID RPDO1)");
-  Serial.println("  3 : BOTH");
-  Serial.println("  h : help");
+  Serial.println("Use:");
+  Serial.println(" 1          → SDO CMD mode (ABS/REL via SDO)");
+  Serial.println(" 2          → PDO HANDLE mode (steering → PDO pos)");
+  Serial.println(" 3          → BOTH DEBUG");
+  Serial.println(" ABS 3000   → absolute move to 3000");
+  Serial.println(" REL 2000   → relative move +2000");
+  Serial.println(" REL -1000  → relative move -1000");
+  Serial.println(" H / HELP   → show help");
 }
 
 void loop(){
-  // 1) 모드 전환 키 입력
-  readModeKey();
+  // 1) PC → 시리얼 명령 처리 (모드 전환 + SDO ABS/REL)
+  processSerialLine();
 
-  // 2) 핸들 명령 수신
-  readSteerCommand();
+  // 2) 핸들 → PDO 모드일 때만 핸들 값 사용
+  if (controlMode == MODE_PDO_HANDLE || controlMode == MODE_BOTH_DEBUG) {
+    readSteerCommand();
 
-  // 3) Fail-safe: 1초 이상 명령 없으면 0으로
-  if (millis() - lastSteerUpdate > 1000) {
-    steer_cmd = 0;
+    if (millis() - lastSteerUpdate > 1000) {
+      steer_cmd = 0;
+    }
+
+    float norm = (float)steer_cmd / 1000.0f;
+    if (norm > -0.02f && norm < 0.02f) {
+      norm = 0.0f;
+    }
+
+    long pos = (long)(norm * (float)MAX_POS);
+    pdo_move_abs(pos);   // ABS 포지션을 PDO로 계속 갱신
+
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 200) {
+      Serial.print("[PDO] steer_cmd=");
+      Serial.print(steer_cmd);
+      Serial.print(" norm=");
+      Serial.print(norm, 3);
+      Serial.print(" pos=");
+      Serial.println(pos);
+      lastPrint = millis();
+    }
   }
 
-  // 4) –1000 ~ +1000 → –1.0 ~ +1.0
-  float norm = (float)steer_cmd / 1000.0f;
-
-  // Deadband: 약간의 중립 영역
-  if (norm > -0.02f && norm < 0.02f) {
-    norm = 0.0f;
-  }
-
-  // 5) –1.0 ~ +1.0 → –MAX_POS ~ +MAX_POS (절대 위치)
-  long pos = (long)(norm * (float)MAX_POS);
-
-  // 6) ABS Position 명령 전송 (SDO/PDO 선택적 사용)
-  send_position_command(pos);
-
-  // 7) 디버그 출력
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 200) {
-    Serial.print("[MODE=");
-    if (controlMode == MODE_SDO_ONLY)      Serial.print("SDO");
-    else if (controlMode == MODE_PDO_ONLY) Serial.print("PDO");
-    else                                   Serial.print("BOTH");
-    Serial.print("] steer_cmd=");
-    Serial.print(steer_cmd);
-    Serial.print("  norm=");
-    Serial.print(norm, 3);
-    Serial.print("  pos=");
-    Serial.println(pos);
-    lastPrint = millis();
-  }
-
-  delay(20); // 약 50 Hz로 포지션 업데이트
+  delay(10);
 }
