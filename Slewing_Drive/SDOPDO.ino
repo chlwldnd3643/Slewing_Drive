@@ -1,6 +1,6 @@
 #include <SPI.h>
 #include "mcp2515_can.h"
-#include <SoftwareSerial.h>
+#include <SoftwareSerial.h"
 
 /* ===== Compat ===== */
 #ifndef MCP_16MHZ
@@ -31,6 +31,10 @@ const uint8_t PIN_INT = 2;    // MCP2515 INT
 // 핸들 → PDO 모드에서 쓸 최대 위치 (중앙 기준 ±MAX_POS)
 long MAX_POS = 200000L;   // 기어비/엔코더에 맞게 조정
 
+// Profile Position Mode에서 쓸 Target speed (Profile velocity, obj 0x6081)
+// 기본값 1000
+long targetSpeed = 1000L;
+
 mcp2515_can CAN(PIN_CS);
 
 /* ===== 핸들 명령 수신용 SoftwareSerial =====
@@ -50,8 +54,8 @@ String steerLine  = "";
 
 /* ===== 제어 모드 ===== */
 enum ControlMode {
-  MODE_SDO_CMD   = 0,   // ABS 3000, REL 2000 같은 SDO 명령 모드
-  MODE_PDO_HANDLE = 1,  // 핸들 → PDO 실시간 포지션
+  MODE_SDO_CMD    = 0,   // ABS 3000, REL 2000 같은 SDO 명령 모드
+  MODE_PDO_HANDLE = 1,   // 핸들 → PDO 실시간 포지션
   MODE_BOTH_DEBUG = 2
 };
 
@@ -92,7 +96,7 @@ bool SDO_write_u16(uint16_t idx, uint8_t sub, uint16_t val){
   return sendCAN(0x600 + NODE_ID, d);
 }
 
-// 32bit SDO (Target Position 0x607A 등에 사용)
+// 32bit SDO (Target Position 0x607A, Target Speed 0x6081 등에 사용)
 bool SDO_write_i32(uint16_t idx, uint8_t sub, int32_t val){
   uint8_t d[8] = {
     0x23,  // 4바이트 write
@@ -105,6 +109,12 @@ bool SDO_write_i32(uint16_t idx, uint8_t sub, int32_t val){
     (uint8_t)((val >> 24) & 0xFF)
   };
   return sendCAN(0x600 + NODE_ID, d);
+}
+
+/* ===== Target Speed(0x6081) 적용 함수 ===== */
+bool apply_target_speed(){
+  // Profile Velocity = targetSpeed
+  return SDO_write_i32(0x6081, 0x00, targetSpeed);
 }
 
 /* ===== PDO: Target Position 송신 =====
@@ -127,11 +137,15 @@ bool enable_drive(){
   SDO_write_u8(0x6060, 0x00, 0x01);
   delay(20);
 
-  // 2) Fault reset-ish
+  // 2) Target speed(Profile Velocity) 설정
+  apply_target_speed();
+  delay(10);
+
+  // 3) Fault reset-ish
   SDO_write_u16(0x6040, 0x00, 0x0086);
   delay(10);
 
-  // 3) Enable operation
+  // 4) Enable operation
   return SDO_write_u16(0x6040, 0x00, 0x000F);
 }
 
@@ -186,7 +200,7 @@ void pdo_move_abs(long pos){
   send_position_core(false, pos, false, true); // ABS, PDO만
 }
 
-/* ===== 시리얼(USB) 한 줄 읽기: 모드 + SDO 명령 =====
+/* ===== 시리얼(USB) 한 줄 읽기: 모드 + SDO 명령 + Target Speed =====
    예:
      "1"           → 모드 SDO_CMD
      "2"           → 모드 PDO_HANDLE
@@ -194,6 +208,7 @@ void pdo_move_abs(long pos){
      "ABS 3000"    → 절대 위치 3000으로 이동 (SDO)
      "REL 2000"    → 현재 위치 기준 +2000 (SDO)
      "REL -1000"   → 현재 위치 기준 -1000 (SDO)
+     "SPD 1000"    → Target speed(0x6081) = 1000 으로 설정
 */
 void processSerialLine()
 {
@@ -218,7 +233,7 @@ void processSerialLine()
       }
       if (line == "2") {
         controlMode = MODE_PDO_HANDLE;
-        Serial.println("[MODE] PDO HANDLE (steering → position)");
+        Serial.println("[MODE] PDO HANDLE (steering → PDO pos)");
         return;
       }
       if (line == "3") {
@@ -230,10 +245,24 @@ void processSerialLine()
         Serial.println("=== HELP ===");
         Serial.println("1         : SDO CMD mode (ABS/REL via SDO)");
         Serial.println("2         : PDO HANDLE mode (steering → PDO pos)");
-        Serial.println("3         : BOTH (debug)");
+        Serial.println("3         : BOTH DEBUG");
         Serial.println("ABS 3000  : absolute move to 3000 (SDO)");
         Serial.println("REL 2000  : relative move +2000 (SDO)");
         Serial.println("REL -1000 : relative move -1000 (SDO)");
+        Serial.println("SPD 1000  : set target speed(Profile Velocity) = 1000");
+        return;
+      }
+
+      // Target speed 설정 (모드 상관없이 항상 허용)
+      if (line.startsWith("SPD")) {
+        line.remove(0, 3);
+        line.trim();
+        long v = line.toInt();
+        if (v <= 0) v = 1;   // 0 이하 방지
+        targetSpeed = v;
+        apply_target_speed();
+        Serial.print("[SPD] target speed(Profile Velocity) = ");
+        Serial.println(targetSpeed);
         return;
       }
 
@@ -321,7 +350,8 @@ void setup(){
   if(!enable_drive()){
     Serial.println("Drive enable failed");
   } else {
-    Serial.println("Drive Enabled (Profile Position Mode).");
+    Serial.print("Drive Enabled (Profile Position Mode). Default SPD=");
+    Serial.println(targetSpeed);
   }
 
   currentPos = 0;
@@ -335,11 +365,12 @@ void setup(){
   Serial.println(" ABS 3000   → absolute move to 3000");
   Serial.println(" REL 2000   → relative move +2000");
   Serial.println(" REL -1000  → relative move -1000");
+  Serial.println(" SPD 1000   → set target speed(Profile Velocity) = 1000");
   Serial.println(" H / HELP   → show help");
 }
 
 void loop(){
-  // 1) PC → 시리얼 명령 처리 (모드 전환 + SDO ABS/REL)
+  // 1) PC → 시리얼 명령 처리 (모드 전환 + SDO ABS/REL + SPD)
   processSerialLine();
 
   // 2) 핸들 → PDO 모드일 때만 핸들 값 사용
