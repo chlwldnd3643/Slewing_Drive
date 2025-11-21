@@ -10,7 +10,7 @@
 #endif
 #ifndef MCP_16MHz
   #ifdef MCP_16MHZ
-    #define MCP_16MHz MCP_16MHZ
+    #define MCP_16MHZ MCP_16MHZ
   #endif
 #endif
 #ifndef MCP_NORMAL
@@ -35,10 +35,10 @@ mcp2515_can CAN(PIN_CS);
      long cmd = (long)(norm * 2500000.0f);
      linkSerial.print('S');
      linkSerial.println(cmd);
-   이런 식으로 "S-123456\n" / "S2500000\n" 형태로 보낸다고 가정.
+   이런 식으로 "S-123456\n" / "S2500000\n" 보내는 것으로 가정.
 */
 const uint8_t LINK_RX_PIN = 8;  // 핸들 TX → 이쪽 RX
-const uint8_t LINK_TX_PIN = 7;  // 안 써도 되는 더미 TX
+const uint8_t LINK_TX_PIN = 7;  // 사용 안 하는 더미 TX
 SoftwareSerial linkSerial(LINK_RX_PIN, LINK_TX_PIN);
 
 // 핸들에서 받은 최종 타겟 포지션 값 (-2,500,000 ~ +2,500,000)
@@ -48,19 +48,27 @@ String steerLine = "";
 /* ===== 모드 설정 ===== */
 enum ControlMode {
   MODE_SDO_CMD    = 0,   // SDO ABS/REL/SPD
-  MODE_HANDLE     = 1,   // 핸들값으로 실시간 위치제어 (PDO 또는 SDO 스트리밍)
+  MODE_HANDLE     = 1,   // 핸들값으로 실시간 위치제어
   MODE_BOTH_DEBUG = 2    // 둘 다 활성
 };
 ControlMode controlMode = MODE_SDO_CMD;
 
 // 핸들 모드에서 진짜 PDO 쓸지, 아니면 SDO 스트리밍으로 갈지 선택
 // true : RPDO1→607A 매핑 + PDO 사용
-// false: PDO 안 믿고 그냥 SDO로 607A를 계속 써줌 (무조건 동작)
+// false: PDO 안 믿고 그냥 SDO로 607A를 계속 써줌 (현재 기본)
 const bool USE_PDO_FOR_HANDLE = false;
 
+/* ===== profile_speed 스케일 =====
+   실측: 6081 = 1000(dec) → 약 0.06 rpm
+   => 1 rpm 당 DEC ≈ 1000 / 0.06 ≈ 16666.7
+*/
+const float DEC_PER_RPM = 1000.0f / 0.06f;
+
+float    g_profSpeedRpm = 200.0f;   // 기본 목표 rpm (체감 기준)
+uint32_t g_profSpeedDec = 0;        // 6081에 실제로 들어가는 DEC 값
+
 /* ===== SDO용 상태 ===== */
-long g_targetPos     = 0;      // 우리가 기억하는 SDO 명령 기준 타겟 위치
-uint32_t g_profSpeed = 1000;   // profile_speed(0x6081)에 쓸 값 (Kinco 내부 단위)
+long g_targetPos = 0;      // 우리가 기억하는 SDO 명령 기준 타겟 위치
 
 /* ===== 공통 SDO 유틸 ===== */
 bool sendCAN(uint32_t id, const uint8_t* data, uint8_t len = 8) {
@@ -123,32 +131,37 @@ bool PDO_write_target_position(long pos) {
   return sendCAN(0x200 + NODE_ID, d);
 }
 
-/* ===== profile_speed(0x6081) 설정 =====
-   단위는 Kinco 내부 단위(매뉴얼 공식 참고). 여기서는 그냥 "속도 크기" 느낌으로 사용하고,
-   실제 감은 실험으로 잡는 방식.
-*/
-void set_profile_speed(uint32_t spd) {
-  if (spd == 0) spd = 1;
-  g_profSpeed = spd;
-  bool ok = SDO_write_u32(0x6081, 0x00, g_profSpeed);
+/* ===== profile_speed(0x6081) 설정 (입력: rpm) ===== */
+void set_profile_speed_rpm(float rpm) {
+  if (rpm < 0.0f) rpm = -rpm;
+  if (rpm < 0.1f) rpm = 0.1f;       // 0 및 너무 작은 속도 방지
 
-  Serial.print(F("[SPD] profile_speed(0x6081) = "));
-  Serial.print(g_profSpeed);
+  float dec_f = rpm * DEC_PER_RPM;  // rpm → 내부 DEC
+  if (dec_f > 4.0e9f) dec_f = 4.0e9f;
+
+  uint32_t dec = (uint32_t)(dec_f + 0.5f);  // 반올림
+  g_profSpeedRpm = rpm;
+  g_profSpeedDec = dec;
+
+  bool ok = SDO_write_u32(0x6081, 0x00, g_profSpeedDec);
+
+  Serial.print(F("[SPD] req rpm="));
+  Serial.print(rpm);
+  Serial.print(F(" -> 6081(dec)="));
+  Serial.print(g_profSpeedDec);
   Serial.println(ok ? F(" (OK)") : F(" (FAIL)"));
 }
 
 /* ===== (선택) RPDO1 → 607A 매핑 =====
-   실제 PDO를 쓰고 싶으면 이 함수를 쓴다.
-   - 1400:01 = COB-ID (0x200+ID)
-   - 1600:01 = 0x607A0020 (index 0x607A, sub 0, 32bit)
+   진짜 PDO를 쓰고 싶다면 이 함수를 활성화해서 사용.
+   (Kinco의 PDO 구조에 따라 값은 조정 필요할 수 있음.)
 */
 void configure_RPDO1_for_target_position() {
   // 1) RPDO1 disable (COB-ID 상위 bit = 1)
-  //    예시로 0x80000200 + NODE_ID (벤더에 따라 다를 수 있음)
   SDO_write_u32(0x1400, 0x01, 0x80000200UL + NODE_ID);
   delay(10);
 
-  // 2) 매핑 지우기 (0개)
+  // 2) 매핑 지우기
   SDO_write_u8(0x1600, 0x00, 0);
   delay(10);
 
@@ -179,11 +192,11 @@ bool enable_drive_position_mode() {
   ok &= SDO_write_u8(0x6060, 0x00, 0x01);
   delay(20);
 
-  // 3) profile_speed (0x6081)
-  set_profile_speed(g_profSpeed);
+  // 3) profile_speed (0x6081) - rpm 기준
+  set_profile_speed_rpm(g_profSpeedRpm);
   delay(20);
 
-  // 4) Controlword = 0x103F
+  // 4) Controlword = 0x103F (네가 확인한 “이래야 움직이는” 값)
   ok &= SDO_write_u16(0x6040, 0x00, 0x103F);
   delay(20);
 
@@ -210,7 +223,7 @@ void sdo_move_rel(long delta) {
    rst         : 0x6040 = 0x0086
    abs <pos>   : 절대 위치 (inc)
    rel <delta> : 상대 이동 (inc)
-   spd <val>   : 6081 profile_speed 값 설정
+   spd <rpm>   : profile_speed를 rpm 기준으로 설정
    1           : MODE_SDO_CMD
    2           : MODE_HANDLE
    3           : MODE_BOTH_DEBUG
@@ -228,7 +241,6 @@ void processSerial() {
 
       String line = serialLine;
       serialLine = "";
-
       line.trim();
       line.toLowerCase();
 
@@ -250,11 +262,11 @@ void processSerial() {
       }
       if (line == "h" || line == "help") {
         Serial.println(F("=== HELP ==="));
-        Serial.println(F(" en          : enable (pos mode + 6081 + 0x103F)"));
+        Serial.println(F(" en          : enable (pos mode + 6081(rpm) + 0x103F)"));
         Serial.println(F(" rst         : 0x6040 = 0x0086 (fault reset)"));
         Serial.println(F(" abs <pos>   : absolute position via SDO (inc)"));
         Serial.println(F(" rel <delta> : relative move via SDO (inc)"));
-        Serial.println(F(" spd <val>   : profile_speed(0x6081) set"));
+        Serial.println(F(" spd <rpm>   : profile_speed(0x6081) set by rpm"));
         Serial.println(F(" 1           : MODE_SDO_CMD"));
         Serial.println(F(" 2           : MODE_HANDLE"));
         Serial.println(F(" 3           : MODE_BOTH_DEBUG"));
@@ -273,16 +285,16 @@ void processSerial() {
         return;
       }
 
-      // spd
+      // spd (입력: rpm)
       if (line.startsWith("spd")) {
         String s = line.substring(3);
         s.trim();
-        uint32_t v = (uint32_t)s.toInt();
-        set_profile_speed(v);
+        float rpm = s.toFloat();
+        set_profile_speed_rpm(rpm);
         return;
       }
 
-      // abs / rel (SDO 모드 또는 BOTH일 때 의미 있음)
+      // abs / rel (SDO 모드 또는 BOTH일 때)
       if (controlMode == MODE_SDO_CMD || controlMode == MODE_BOTH_DEBUG) {
         if (line.startsWith("abs")) {
           String s = line.substring(3);
@@ -325,7 +337,6 @@ void readSteerCommand() {
       if (steerLine[0] == 'S') {
         long val = steerLine.substring(1).toInt();  // "S-123456" → -123456
 
-        // 혹시라도 이상값이면 한 번 더 클램프
         if (val >  2500000L) val =  2500000L;
         if (val < -2500000L) val = -2500000L;
 
@@ -359,8 +370,8 @@ void setup() {
   }
   CAN.setMode(MCP_NORMAL);
 
-  Serial.println(F("=== Kinco FD1x5 Slewing Controller (Final) ==="));
-  Serial.println(F(" 1) 전원 후 'en' → pos mode + 6081 + 0x103F"));
+  Serial.println(F("=== Kinco FD1x5 Slewing Controller (Final, rpm-based SPD) ==="));
+  Serial.println(F(" 1) 전원 후 'en' → pos mode + profile_speed(rpm) + 0x103F"));
   Serial.println(F(" 2) MODE 1: abs/rel/spd (SDO)"));
   Serial.println(F(" 3) MODE 2: 핸들 → target position (-2.5M~+2.5M)"));
   Serial.println(F(" 명령: en, rst, abs, rel, spd, 1/2/3, h/help"));
@@ -373,10 +384,10 @@ void setup() {
 }
 
 void loop() {
-  // 1) PC 시리얼 명령
+  // 1) PC 시리얼 명령 처리
   processSerial();
 
-  // 2) 핸들 모드일 때: 핸들값 반영
+  // 2) 핸들 모드일 때: 핸들값을 target position에 반영
   if (controlMode == MODE_HANDLE || controlMode == MODE_BOTH_DEBUG) {
     readSteerCommand();
 
@@ -386,9 +397,9 @@ void loop() {
       // ---- 정석 PDO 방식 ----
       PDO_write_target_position(pos);
     } else {
-      // ---- 확실하게 움직이게 하는 SDO 스트리밍 방식 ----
+      // ---- 무조건 움직이게 하는 SDO 스트리밍 방식 ----
       SDO_write_i32(0x607A, 0x00, pos);
-      // 필요시 아래 한 줄 켜서 새 세트포인트 토글 강화도 가능
+      // 필요하면 아래 한 줄 활성화해서 새 setpoint 플래그를 재강조할 수도 있음
       // SDO_write_u16(0x6040, 0x00, 0x103F);
     }
 
