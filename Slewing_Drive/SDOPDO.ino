@@ -1,415 +1,238 @@
+#include <Arduino.h>
+/* * STM32 전용: Software Interlock & PDO State Machine 버전 (V10)
+ * KR 자율운항선박 지침: 브레이크 체결 시 모터 토크 인가 방지 (Interlock)
+ * Controlword(0x6040) 조작을 통해 하드웨어 레벨의 안전을 보장합니다.
+ */
 #include <SPI.h>
 #include "mcp2515_can.h"
-#include <SoftwareSerial.h>
 
-/* ===== MCP2515 / CAN 설정 ===== */
-#ifndef MCP_16MHZ
-  #ifdef MCP_16MHz
-    #define MCP_16MHZ MCP_16MHz
-  #endif
-#endif
-#ifndef MCP_16MHz
-  #ifdef MCP_16MHZ
-    #define MCP_16MHZ MCP_16MHZ
-  #endif
-#endif
-#ifndef MCP_NORMAL
-  #define MCP_NORMAL 0x00
-#endif
-#ifndef CAN_OK
-  #define CAN_OK (0)
-#endif
+/* ===== 하드웨어 핀 설정 ===== */
+#define CAN1_CS  PA4  
+#define CAN2_CS  PA15 
+#define CAN_INT  PB0
 
-// ---- 유저 설정 ----
-uint8_t  NODE_ID    = 1;     // Kinco 드라이브 노드 ID
-const uint8_t PIN_CS  = 9;   // MCP2515 CS
-const uint8_t PIN_INT = 2;   // MCP2515 INT
+#define PIN_POWER_SENSE     PB12 
+#define PIN_BRAKE_RELAY     PA1  
 
-#define FIXED_BAUD  CAN_250KBPS
-#define FIXED_CLK   MCP_16MHz
+mcp2515_can CAN1(CAN1_CS);
+mcp2515_can CAN2(CAN2_CS);
 
-mcp2515_can CAN(PIN_CS);
+/* ===== 제어 및 모니터링 파라미터 ===== */
+const uint32_t CONTROL_PERIOD_US = 20000;   // 20ms
+const uint32_t TIMEOUT_MS = 200;            
+const uint32_t HEARTBEAT_TIMEOUT_MS = 500;  
+const uint8_t  BUS_ERROR_THRESHOLD = 96;
 
-/* ===== 핸들 보드와의 UART 링크 =====
-   핸들 아두이노에서:
-     long cmd = (long)(norm * 2500000.0f);
-     linkSerial.print('S');
-     linkSerial.println(cmd);
-   이런 식으로 "S-123456\n" / "S2500000\n" 보내는 것으로 가정.
-*/
-const uint8_t LINK_RX_PIN = 8;  // 핸들 TX → 이쪽 RX
-const uint8_t LINK_TX_PIN = 7;  // 사용 안 하는 더미 TX
-SoftwareSerial linkSerial(LINK_RX_PIN, LINK_TX_PIN);
+const long  ERROR_LIMIT_1_DEG = 27777;      
+const uint16_t MAX_ERROR_TICKS = 50;        
 
-// 핸들에서 받은 최종 타겟 포지션 값 (-2,500,000 ~ +2,500,000)
-long steer_cmd = 0;
-String steerLine = "";
+const float MAX_VEL   = 8000.0f;    
+const float MAX_ACCEL = 400.0f;     
+const float STOP_MARGIN = 10.0f;    
 
-/* ===== 모드 설정 ===== */
-enum ControlMode {
-  MODE_SDO_CMD    = 0,   // SDO ABS/REL/SPD
-  MODE_HANDLE     = 1,   // 핸들값으로 실시간 위치제어
-  MODE_BOTH_DEBUG = 2    // 둘 다 활성
-};
-ControlMode controlMode = MODE_SDO_CMD;
+/* ===== 시스템 상태 (volatile) ===== */
+volatile long  steer_cmd = 0;       
+volatile float profile_pos = 0;     
+volatile float current_vel = 0;     
+volatile long  actual_pos = 0;      
 
-// 핸들 모드에서 진짜 PDO 쓸지, 아니면 SDO 스트리밍으로 갈지 선택
-// true : RPDO1→607A 매핑 + PDO 사용
-// false: PDO 안 믿고 그냥 SDO로 607A를 계속 써줌 (현재 기본)
-const bool USE_PDO_FOR_HANDLE = false;
+volatile bool  is_emergency = false;
+volatile bool  is_power_lost = false;       
+volatile bool  is_steering_fault = false;   
+volatile uint16_t error_persistence_cnt = 0; 
+volatile uint32_t last_steer_tick = 0;
 
-/* ===== profile_speed 스케일 =====
-   실측: 6081 = 1000(dec) → 약 0.06 rpm
-   => 1 rpm 당 DEC ≈ 1000 / 0.06 ≈ 16666.7
-*/
-const float DEC_PER_RPM = 1000.0f / 0.06f;
+// [신규] 드라이버 제어 상태 변수
+volatile uint16_t control_word = 0x0006;    // 초기값: Disable Voltage (Safe)
 
-float    g_profSpeedRpm = 200.0f;   // 기본 목표 rpm (체감 기준)
-uint32_t g_profSpeedDec = 0;        // 6081에 실제로 들어가는 DEC 값
+// Dual CAN 상태
+volatile uint32_t last_hb_can1 = 0, last_hb_can2 = 0;
+volatile bool can1_healthy = false, can2_healthy = false;
+volatile uint8_t can1_tec = 0, can1_rec = 0, can2_tec = 0, can2_rec = 0;
+volatile uint8_t driver_state = 0;
 
-/* ===== SDO용 상태 ===== */
-long g_targetPos = 0;      // 우리가 기억하는 SDO 명령 기준 타겟 위치
+/* ===== CANopen ID ===== */
+#define NODE_ID 1
+#define COB_ID_SYNC      0x80
+#define COB_ID_RPDO1     (0x200 + NODE_ID) // Mapping: 6040(16bit) + 607A(32bit)
+#define COB_ID_TPDO1     (0x180 + NODE_ID) 
+#define COB_ID_HEARTBEAT (0x700 + NODE_ID)
 
-/* ===== 공통 SDO 유틸 ===== */
-bool sendCAN(uint32_t id, const uint8_t* data, uint8_t len = 8) {
-  return CAN.sendMsgBuf(id, 0, len, (unsigned char*)data) == CAN_OK;
+HardwareTimer *MyTim;
+
+/* ===== 전원 상실 인터럽트 서비스 루틴 (EXTI) ===== */
+void PowerLoss_ISR() {
+    digitalWrite(PIN_BRAKE_RELAY, LOW); 
+    is_power_lost = true;
+    is_emergency = true;
 }
 
-bool SDO_write_u8(uint16_t idx, uint8_t sub, uint8_t val) {
-  uint8_t d[8] = {
-    0x2F,
-    (uint8_t)(idx & 0xFF),
-    (uint8_t)(idx >> 8),
-    sub,
-    val, 0, 0, 0
-  };
-  return sendCAN(0x600 + NODE_ID, d);
-}
-
-bool SDO_write_u16(uint16_t idx, uint8_t sub, uint16_t val) {
-  uint8_t d[8] = {
-    0x2B,
-    (uint8_t)(idx & 0xFF),
-    (uint8_t)(idx >> 8),
-    sub,
-    (uint8_t)(val & 0xFF),
-    (uint8_t)(val >> 8),
-    0, 0
-  };
-  return sendCAN(0x600 + NODE_ID, d);
-}
-
-bool SDO_write_u32(uint16_t idx, uint8_t sub, uint32_t val) {
-  uint8_t d[8] = {
-    0x23,
-    (uint8_t)(idx & 0xFF),
-    (uint8_t)(idx >> 8),
-    sub,
-    (uint8_t)(val & 0xFF),
-    (uint8_t)((val >> 8) & 0xFF),
-    (uint8_t)((val >> 16) & 0xFF),
-    (uint8_t)((val >> 24) & 0xFF)
-  };
-  return sendCAN(0x600 + NODE_ID, d);
-}
-
-bool SDO_write_i32(uint16_t idx, uint8_t sub, int32_t val) {
-  return SDO_write_u32(idx, sub, (uint32_t)val);
-}
-
-/* ===== PDO : 타겟 포지션 (607A) 송신 =====
-   가정: RPDO1(0x1400 / 0x1600)이 607A:00, 32bit로 매핑되어 있고
-        COB-ID = 0x200 + NODE_ID
-*/
-bool PDO_write_target_position(long pos) {
-  uint8_t d[8];
-  d[0] = (uint8_t)( pos        & 0xFF);
-  d[1] = (uint8_t)((pos >> 8 ) & 0xFF);
-  d[2] = (uint8_t)((pos >> 16) & 0xFF);
-  d[3] = (uint8_t)((pos >> 24) & 0xFF);
-  d[4] = d[5] = d[6] = d[7] = 0;
-  return sendCAN(0x200 + NODE_ID, d);
-}
-
-/* ===== profile_speed(0x6081) 설정 (입력: rpm) ===== */
-void set_profile_speed_rpm(float rpm) {
-  if (rpm < 0.0f) rpm = -rpm;
-  if (rpm < 0.1f) rpm = 0.1f;       // 0 및 너무 작은 속도 방지
-
-  float dec_f = rpm * DEC_PER_RPM;  // rpm → 내부 DEC
-  if (dec_f > 4.0e9f) dec_f = 4.0e9f;
-
-  uint32_t dec = (uint32_t)(dec_f + 0.5f);  // 반올림
-  g_profSpeedRpm = rpm;
-  g_profSpeedDec = dec;
-
-  bool ok = SDO_write_u32(0x6081, 0x00, g_profSpeedDec);
-
-  Serial.print(F("[SPD] req rpm="));
-  Serial.print(rpm);
-  Serial.print(F(" -> 6081(dec)="));
-  Serial.print(g_profSpeedDec);
-  Serial.println(ok ? F(" (OK)") : F(" (FAIL)"));
-}
-
-/* ===== (선택) RPDO1 → 607A 매핑 =====
-   진짜 PDO를 쓰고 싶다면 이 함수를 활성화해서 사용.
-   (Kinco의 PDO 구조에 따라 값은 조정 필요할 수 있음.)
-*/
-void configure_RPDO1_for_target_position() {
-  // 1) RPDO1 disable (COB-ID 상위 bit = 1)
-  SDO_write_u32(0x1400, 0x01, 0x80000200UL + NODE_ID);
-  delay(10);
-
-  // 2) 매핑 지우기
-  SDO_write_u8(0x1600, 0x00, 0);
-  delay(10);
-
-  // 3) 607A:00, 32bit로 매핑
-  SDO_write_u32(0x1600, 0x01, 0x607A0020UL);
-  delay(10);
-
-  // 4) 매핑 개수 = 1
-  SDO_write_u8(0x1600, 0x00, 1);
-  delay(10);
-
-  // 5) RPDO1 enable : COB-ID = 0x200 + NODE_ID
-  SDO_write_u32(0x1400, 0x01, 0x200 + NODE_ID);
-  delay(10);
-
-  Serial.println(F("[RPDO] RPDO1 mapped to 0x607A:00, COB-ID=0x200+ID"));
-}
-
-/* ===== 드라이브 Enable (Position Mode + 0x103F) ===== */
-bool enable_drive_position_mode() {
-  bool ok = true;
-
-  // 1) Fault reset (0x86)
-  ok &= SDO_write_u16(0x6040, 0x00, 0x0086);
-  delay(20);
-
-  // 2) Mode of operation = 1 (Profile Position Mode)
-  ok &= SDO_write_u8(0x6060, 0x00, 0x01);
-  delay(20);
-
-  // 3) profile_speed (0x6081) - rpm 기준
-  set_profile_speed_rpm(g_profSpeedRpm);
-  delay(20);
-
-  // 4) Controlword = 0x103F (네가 확인한 “이래야 움직이는” 값)
-  ok &= SDO_write_u16(0x6040, 0x00, 0x103F);
-  delay(20);
-
-  return ok;
-}
-
-/* ===== SDO 포지션 명령 (ABS / REL) ===== */
-void sdo_move_abs(long pos) {
-  g_targetPos = pos;
-  SDO_write_i32(0x607A, 0x00, g_targetPos);  // 103F 상태에서 607A 변경 → 바로 이동
-  delay(5);
-
-  Serial.print(F("[SDO ABS] targetPos = "));
-  Serial.println(g_targetPos);
-}
-
-void sdo_move_rel(long delta) {
-  g_targetPos += delta;
-  sdo_move_abs(g_targetPos);
-}
-
-/* ===== 시리얼 명령 처리 =====
-   en          : enable (pos mode + profile_speed + 103F)
-   rst         : 0x6040 = 0x0086
-   abs <pos>   : 절대 위치 (inc)
-   rel <delta> : 상대 이동 (inc)
-   spd <rpm>   : profile_speed를 rpm 기준으로 설정
-   1           : MODE_SDO_CMD
-   2           : MODE_HANDLE
-   3           : MODE_BOTH_DEBUG
-   h / help    : 도움말
-*/
-String serialLine = "";
-
-void processSerial() {
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    if (c == '\r') continue;
-
-    if (c == '\n') {
-      if (serialLine.length() == 0) return;
-
-      String line = serialLine;
-      serialLine = "";
-      line.trim();
-      line.toLowerCase();
-
-      // 모드 전환
-      if (line == "1") {
-        controlMode = MODE_SDO_CMD;
-        Serial.println(F("[MODE] SDO CMD (ABS/REL/SPD)"));
-        return;
-      }
-      if (line == "2") {
-        controlMode = MODE_HANDLE;
-        Serial.println(F("[MODE] HANDLE (steering → target position)"));
-        return;
-      }
-      if (line == "3") {
-        controlMode = MODE_BOTH_DEBUG;
-        Serial.println(F("[MODE] BOTH (SDO + HANDLE)"));
-        return;
-      }
-      if (line == "h" || line == "help") {
-        Serial.println(F("=== HELP ==="));
-        Serial.println(F(" en          : enable (pos mode + 6081(rpm) + 0x103F)"));
-        Serial.println(F(" rst         : 0x6040 = 0x0086 (fault reset)"));
-        Serial.println(F(" abs <pos>   : absolute position via SDO (inc)"));
-        Serial.println(F(" rel <delta> : relative move via SDO (inc)"));
-        Serial.println(F(" spd <rpm>   : profile_speed(0x6081) set by rpm"));
-        Serial.println(F(" 1           : MODE_SDO_CMD"));
-        Serial.println(F(" 2           : MODE_HANDLE"));
-        Serial.println(F(" 3           : MODE_BOTH_DEBUG"));
-        return;
-      }
-
-      // enable / reset
-      if (line == "en") {
-        bool ok = enable_drive_position_mode();
-        Serial.println(ok ? F("[EN] OK") : F("[EN] FAIL"));
-        return;
-      }
-      if (line == "rst") {
-        bool ok = SDO_write_u16(0x6040, 0x00, 0x0086);
-        Serial.println(ok ? F("[RST] 0x86 OK") : F("[RST] FAIL"));
-        return;
-      }
-
-      // spd (입력: rpm)
-      if (line.startsWith("spd")) {
-        String s = line.substring(3);
-        s.trim();
-        float rpm = s.toFloat();
-        set_profile_speed_rpm(rpm);
-        return;
-      }
-
-      // abs / rel (SDO 모드 또는 BOTH일 때)
-      if (controlMode == MODE_SDO_CMD || controlMode == MODE_BOTH_DEBUG) {
-        if (line.startsWith("abs")) {
-          String s = line.substring(3);
-          s.trim();
-          long p = s.toInt();
-          sdo_move_abs(p);
-          return;
-        }
-        if (line.startsWith("rel")) {
-          String s = line.substring(3);
-          s.trim();
-          long d = s.toInt();
-          sdo_move_rel(d);
-          return;
-        }
-      }
-
-      Serial.print(F("[WARN] Unknown cmd: "));
-      Serial.println(line);
-      return;
+/* ===== [핵심] 브레이크 및 소프트웨어 인터락 로직 ===== */
+void Update_Brake_And_Interlock() {
+    // 1. 물리 브레이크 제어
+    if (is_emergency || is_power_lost || is_steering_fault) {
+        digitalWrite(PIN_BRAKE_RELAY, LOW); // 브레이크 잠금
+        // 2. 소프트웨어 인터락: 브레이크가 잠기면 토크 해제 (Disable Operation)
+        control_word = 0x0006; 
     } else {
-      if (serialLine.length() < 64) {
-        serialLine += c;
-      } else {
-        serialLine = "";
-      }
+        digitalWrite(PIN_BRAKE_RELAY, HIGH); // 브레이크 해제
+        // 3. 브레이크가 풀린 상태에서만 운전 가능 (Enable Operation)
+        control_word = 0x103F; 
     }
-  }
 }
 
-/* ===== 핸들 아두이노에서 오는 S<long>\n 파싱 ===== */
-void readSteerCommand() {
-  while (linkSerial.available() > 0) {
-    char c = linkSerial.read();
-    if (c == '\r') continue;
-
-    if (c == '\n') {
-      if (steerLine.length() == 0) return;
-
-      if (steerLine[0] == 'S') {
-        long val = steerLine.substring(1).toInt();  // "S-123456" → -123456
-
-        if (val >  2500000L) val =  2500000L;
-        if (val < -2500000L) val = -2500000L;
-
-        steer_cmd = val;
-      }
-      steerLine = "";
+/* ===== 조향 오차 감시 로직 ===== */
+void Monitor_Steering_Performance() {
+    long current_error = abs((long)profile_pos - actual_pos);
+    if (current_error > ERROR_LIMIT_1_DEG) {
+        error_persistence_cnt++;
+        if (error_persistence_cnt >= MAX_ERROR_TICKS) is_steering_fault = true;
     } else {
-      if (steerLine.length() < 24) {
-        steerLine += c;
-      } else {
-        steerLine = "";
-      }
+        if (error_persistence_cnt > 0) error_persistence_cnt--;
+        if (error_persistence_cnt == 0) is_steering_fault = false;
     }
-  }
 }
 
-/* ===== Setup / Loop ===== */
+/* ===== Trapezoidal Motion Profile 연산 ===== */
+void Update_Motion_Profile() {
+    // [인터락] 브레이크가 잠겨있거나 토크가 해제된 상태면 프로필 업데이트 중단
+    if (control_word != 0x103F) {
+        current_vel = 0;
+        return; 
+    }
+
+    float target = (float)steer_cmd;
+    float distance = target - profile_pos;
+    float abs_dist = abs(distance);
+
+    if (abs_dist < STOP_MARGIN) {
+        profile_pos = target;
+        current_vel = 0;
+        return;
+    }
+
+    float stopping_dist = (current_vel * current_vel) / (2.0f * MAX_ACCEL);
+
+    if (abs_dist > stopping_dist) {
+        if (distance > 0) {
+            current_vel += MAX_ACCEL;
+            if (current_vel > MAX_VEL) current_vel = MAX_VEL;
+        } else {
+            current_vel -= MAX_ACCEL;
+            if (current_vel < -MAX_VEL) current_vel = -MAX_VEL;
+        }
+    } else {
+        if (current_vel > 0) {
+            current_vel -= MAX_ACCEL;
+            if (current_vel < 0) current_vel = 0;
+        } else if (current_vel < 0) {
+            current_vel += MAX_ACCEL;
+            if (current_vel > 0) current_vel = 0;
+        }
+    }
+    profile_pos += current_vel;
+}
+
+void Check_Bus_Errors(mcp2515_can &can, volatile uint8_t &tec, volatile uint8_t &rec) {
+    tec = can.errorCountTX();
+    rec = can.errorCountRX();
+}
+
+/* ===== 타이머 인터럽트 서비스 루틴 (ISR) ===== */
+void Control_ISR(void) {
+    Check_Bus_Errors(CAN1, can1_tec, can1_rec);
+    Check_Bus_Errors(CAN2, can2_tec, can2_rec);
+
+    CAN1.sendMsgBuf(COB_ID_SYNC, 0, 0, NULL);
+    CAN2.sendMsgBuf(COB_ID_SYNC, 0, 0, NULL);
+
+    auto processReceive = [](mcp2515_can &can, volatile uint32_t &hb_tick) {
+        while (can.checkReceive() == CAN_MSGAVAIL) {
+            unsigned long id;
+            uint8_t len, buf[8];
+            can.readMsgBuf(&id, &len, buf);
+            if (id == COB_ID_TPDO1) {
+                actual_pos = ((long)buf[3] << 24) | ((long)buf[2] << 16) | ((long)buf[1] << 8) | (long)buf[0];
+            } else if (id == COB_ID_HEARTBEAT) {
+                driver_state = buf[0];
+                hb_tick = millis();
+            }
+        }
+    };
+    processReceive(CAN1, last_hb_can1);
+    processReceive(CAN2, last_hb_can2);
+
+    // 1. 비상 상황 및 인터락 상태 업데이트
+    can1_healthy = (millis() - last_hb_can1 < HEARTBEAT_TIMEOUT_MS) && (can1_tec < BUS_ERROR_THRESHOLD);
+    can2_healthy = (millis() - last_hb_can2 < HEARTBEAT_TIMEOUT_MS) && (can2_tec < BUS_ERROR_THRESHOLD);
+    bool handle_fail = (millis() - last_steer_tick > TIMEOUT_MS);
+    
+    if (handle_fail || (!can1_healthy && !can2_healthy) || is_steering_fault || is_power_lost) {
+        is_emergency = true;
+    } else {
+        is_emergency = false;
+    }
+
+    // [신규] 브레이크 상태에 따른 Controlword 및 인터락 결정
+    Update_Brake_And_Interlock();
+
+    // 2. 모션 프로필 업데이트 (인터락 상태 반영됨)
+    Update_Motion_Profile();
+    Monitor_Steering_Performance();
+
+    // 3. RPDO 전송 (Controlword 16bit + Target Position 32bit)
+    // 데이터 구조: [Control L][Control H][Pos L][Pos M1][Pos M2][Pos H]
+    long final_pos = (long)profile_pos;
+    uint8_t d[6];
+    d[0] = (uint8_t)(control_word & 0xFF);
+    d[1] = (uint8_t)((control_word >> 8) & 0xFF);
+    d[2] = (uint8_t)(final_pos & 0xFF);
+    d[3] = (uint8_t)((final_pos >> 8) & 0xFF);
+    d[4] = (uint8_t)((final_pos >> 16) & 0xFF);
+    d[5] = (uint8_t)((final_pos >> 24) & 0xFF);
+    
+    CAN1.sendMsgBuf(COB_ID_RPDO1, 0, 6, d);
+    CAN2.sendMsgBuf(COB_ID_RPDO1, 0, 6, d);
+}
+
 void setup() {
-  Serial.begin(115200);
-  while (!Serial) {}
+    Serial.begin(115200);
+    Serial1.begin(57600); 
 
-  pinMode(PIN_INT, INPUT);
-  pinMode(10, OUTPUT);   // SPI SS (MCP2515용)
+    pinMode(PIN_BRAKE_RELAY, OUTPUT);
+    digitalWrite(PIN_BRAKE_RELAY, LOW); 
+    
+    pinMode(PIN_POWER_SENSE, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(PIN_POWER_SENSE), PowerLoss_ISR, FALLING);
 
-  linkSerial.begin(57600);   // 핸들 아두이노와 동일 속도
+    if (CAN1.begin(CAN_250KBPS, MCP_16MHz) != 0 || CAN2.begin(CAN_250KBPS, MCP_16MHz) != 0) {
+        while (1) Serial.println("Dual CAN Init Fail!");
+    }
+    CAN1.setMode(MCP_NORMAL);
+    CAN2.setMode(MCP_NORMAL);
 
-  byte ret = CAN.begin(FIXED_BAUD, FIXED_CLK);
-  if (ret != CAN_OK) {
-    Serial.println(F("CAN init failed"));
-    while (1) {}
-  }
-  CAN.setMode(MCP_NORMAL);
+    MyTim = new HardwareTimer(TIM2); 
+    MyTim->setOverflow(CONTROL_PERIOD_US, MICROSEC_FORMAT); 
+    MyTim->attachInterrupt(Control_ISR); 
+    MyTim->resume(); 
 
-  Serial.println(F("=== Kinco FD1x5 Slewing Controller (Final, rpm-based SPD) ==="));
-  Serial.println(F(" 1) 전원 후 'en' → pos mode + profile_speed(rpm) + 0x103F"));
-  Serial.println(F(" 2) MODE 1: abs/rel/spd (SDO)"));
-  Serial.println(F(" 3) MODE 2: 핸들 → target position (-2.5M~+2.5M)"));
-  Serial.println(F(" 명령: en, rst, abs, rel, spd, 1/2/3, h/help"));
-
-  if (USE_PDO_FOR_HANDLE) {
-    configure_RPDO1_for_target_position();
-  }
-
-  controlMode = MODE_SDO_CMD;
+    Serial.println("V10: Software Interlock & State Machine Initialized");
 }
 
 void loop() {
-  // 1) PC 시리얼 명령 처리
-  processSerial();
-
-  // 2) 핸들 모드일 때: 핸들값을 target position에 반영
-  if (controlMode == MODE_HANDLE || controlMode == MODE_BOTH_DEBUG) {
-    readSteerCommand();
-
-    long pos = steer_cmd;   // 이미 -2,500,000 ~ +2,500,000 범위의 최종 위치값
-
-    if (USE_PDO_FOR_HANDLE) {
-      // ---- 정석 PDO 방식 ----
-      PDO_write_target_position(pos);
-    } else {
-      // ---- 무조건 움직이게 하는 SDO 스트리밍 방식 ----
-      SDO_write_i32(0x607A, 0x00, pos);
-      // 필요하면 아래 한 줄 활성화해서 새 setpoint 플래그를 재강조할 수도 있음
-      // SDO_write_u16(0x6040, 0x00, 0x103F);
+    if (Serial1.available() > 0) {
+        String input = Serial1.readStringUntil('\n');
+        if (input.startsWith("S")) {
+            steer_cmd = input.substring(1).toInt();
+            last_steer_tick = millis();
+        }
     }
 
-    static unsigned long lastPrint = 0;
-    if (millis() - lastPrint > 200) {
-      Serial.print(F("[HANDLE] targetPos="));
-      Serial.println(pos);
-      lastPrint = millis();
+    static uint32_t lastLog = 0;
+    if (millis() - lastLog > 200) {
+        lastLog = millis();
+        Serial.print("CtrlWord:0x"); Serial.print(control_word, HEX);
+        Serial.print(" | Brake:"); Serial.print(digitalRead(PIN_BRAKE_RELAY) ? "OPEN" : "LOCKED");
+        Serial.print(" | Pos:"); Serial.println((long)profile_pos);
     }
-  }
-
-  delay(10);
 }
