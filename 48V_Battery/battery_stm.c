@@ -1,95 +1,87 @@
 #include <Arduino.h>
-#include <SPI.h>
-#include "mcp2515_can.h"
+#include "ACANFD_STM32.h"
 
 // =====================
-// HW Config (EDIT THIS)
+// DALY CAN IDs (Extended 29-bit)
 // =====================
-// Nucleo에서 CS 핀만 원하는 GPIO로 지정하면 됩니다.
-// 예: D10, D9 등
-#define SPI_CS_PIN 9
-
-// MCP2515 CAN
-mcp2515_can CAN(SPI_CS_PIN);
+static const uint32_t DALY_REQ_ID = 0x18100140;  // Host -> BMS (ext)
+static const uint32_t DALY_RSP_ID = 0x18104001;  // BMS  -> Host (ext)
 
 // =====================
-// DALY CAN IDs (Extended)
+// Request rotation
 // =====================
-static const unsigned long DALY_REQ_ID = 0x18100140;  // Host -> BMS (ext)
-static const unsigned long DALY_RSP_ID = 0x18104001;  // BMS  -> Host (ext)
+static const uint8_t REQ_LIST[4] = {0x90, 0x92, 0x93, 0x98};
+static uint8_t reqIdx = 0;
 
 // =====================
-// App State
+// Timing / state
 // =====================
-bool systemStarted = false;
-unsigned long lastSend = 0;
-const uint8_t ID_LIST[4] = {0x90, 0x92, 0x93, 0x98};
-int idx = 0;
+static bool systemStarted = false;
+static uint32_t lastSendMs = 0;
+static uint8_t lastReqId = 0x90;
 
 // =====================
-// Forward Decls
+// Forward decl
 // =====================
-void waitForStart();
-void stop_control();
-void initCAN();
+static void waitForStart();
+static void stop_control();
+static void initCAN_250k_extFilter();
 
-void requestCAN(uint8_t dataId);
-void receiveCAN(uint8_t expectedDataId);
+static void requestCAN(uint8_t dataId);
+static void receiveAndHandle();
 
-void parse_DALY_0x90(const uint8_t* buf, uint8_t len);
-void parse_DALY_0x92(const uint8_t* buf, uint8_t len);
-void parse_DALY_0x93(const uint8_t* buf, uint8_t len);
-void parse_DALY_0x98(const uint8_t* buf, uint8_t len);
-void printFlag(const char* name);
+static void dumpFrame(const CANFDMessage &rx);
+static void handleByLastRequest(const uint8_t* buf, uint8_t len, uint8_t expectedDataId);
 
-// =====================
-// Setup / Loop
-// =====================
+// DALY parsers (original logic)
+static void parse_DALY_0x90(const uint8_t* buf, uint8_t len);
+static void parse_DALY_0x92(const uint8_t* buf, uint8_t len);
+static void parse_DALY_0x93(const uint8_t* buf, uint8_t len);
+static void parse_DALY_0x98(const uint8_t* buf, uint8_t len);
+static void printFlag(const char* name);
+
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  while (!Serial) { delay(10); }
 
   waitForStart();
+  initCAN_250k_extFilter();
 
-  SPI.begin();      // STM32에서는 명시적으로 해주는 편이 안전
-  initCAN();
-
-  Serial.println("CAN BUS init OK");
-  delay(100);
+  Serial.println("FDCAN init OK (Classic CAN 2.0, 250kbps, Extended ID)");
+  Serial.println("Type 's' then Enter to reset.");
 }
 
 void loop() {
-  // 간단 명령 처리: "stop" 또는 "s"
+  // Serial command
   if (Serial.available()) {
-    String command = Serial.readStringUntil('\n');
-    command.trim();
-    command.toLowerCase();
-    if (command == "stop" || command == "s") {
-      stop_control();
-    }
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "s" || cmd == "S") stop_control();
   }
 
-  // 1초마다 요청
-  if (millis() - lastSend > 1000) {
-    requestCAN(ID_LIST[idx]);
-    lastSend = millis();
+  // Send request every 1000 ms
+  if (millis() - lastSendMs >= 1000) {
+    lastReqId = REQ_LIST[reqIdx];
+    requestCAN(lastReqId);
+
+    reqIdx = (reqIdx + 1) % 4;
+    lastSendMs = millis();
   }
 
-  // 수신/파싱
-  receiveCAN(ID_LIST[idx]);
+  // Receive + parse
+  receiveAndHandle();
 
-  idx = (idx + 1) % 4;
-  delay(90);
+  delay(5);
 }
 
 // =====================
-// Functions
+// Start/Stop
 // =====================
-void waitForStart() {
+static void waitForStart() {
   Serial.println("Press 'S' to start the system.");
   while (!systemStarted) {
     if (Serial.available()) {
-      char c = Serial.read();
+      char c = (char)Serial.read();
       if (c == 'S' || c == 's') {
         systemStarted = true;
         Serial.println("System started.");
@@ -99,75 +91,118 @@ void waitForStart() {
   }
 }
 
-void stop_control() {
+static void stop_control() {
   Serial.println("System resetting...");
   delay(50);
-
-  // STM32 리셋 (Watchdog 대신)
   NVIC_SystemReset();
-
-  // 여긴 도달하지 않음
-  while (true) {}
 }
 
-void initCAN() {
-  // MCP2515 init loop
-  while (CAN.begin(CAN_250KBPS) != CAN_OK) {
-    Serial.println("CAN Init Fail");
-    delay(100);
-  }
-  Serial.println("CAN Init OK");
-  delay(100);
-}
+// =====================
+// CAN init (NUCLEO-G431RB + SN65HVD230)
+// Pins assumed: PB9=TX, PB8=RX
+// =====================
+static void initCAN_250k_extFilter() {
+  ACANFD_STM32_Settings settings(250 * 1000, DataBitRateFactor::x1);
+  settings.mModuleMode = ACANFD_STM32_Settings::DISABLE_FD; // Classic CAN
+  settings.mEnableRetransmission = true;
 
-void requestCAN(uint8_t dataId) {
-  uint8_t requestData[8] = {dataId, 0, 0, 0, 0, 0, 0, 0};
+  // Fixed pins (assumed)
+  settings.mTxPin = PB_9;  // FDCAN1_TX
+  settings.mRxPin = PB_8;  // FDCAN1_RX
 
-  // sendMsgBuf(id, ext, len, data)
-  // ext=1 => Extended ID
-  byte rc = CAN.sendMsgBuf(DALY_REQ_ID, 1, 8, requestData);
-  if (rc != CAN_OK) {
-    Serial.print("CAN send fail, rc=");
-    Serial.println(rc);
-  }
-}
+  // Filters: accept only DALY_RSP_ID (extended)
+  ACANFD_STM32_StandardFilters stdFilters;
+  ACANFD_STM32_ExtendedFilters extFilters;
+  extFilters.addSingle(DALY_RSP_ID, ACANFD_STM32_FilterAction::FIFO0);
 
-void receiveCAN(uint8_t expectedDataId) {
-  while (CAN.checkReceive() == CAN_MSGAVAIL) {
-    uint8_t len = 0;
-    uint8_t buf[8];
+  settings.mNonMatchingExtendedFrameReception = ACANFD_STM32_FilterAction::REJECT;
+  settings.mNonMatchingStandardFrameReception = ACANFD_STM32_FilterAction::REJECT;
 
-    CAN.readMsgBuf(&len, buf);
-    unsigned long id = CAN.getCanId();
-
-    if (id == DALY_RSP_ID) {
-      // DALY 응답은 같은 ID로 오므로,
-      // 어떤 요청(0x90/0x92/0x93/0x98)을 보냈는지에 따라 파싱
-      switch (expectedDataId) {
-        case 0x90:
-          parse_DALY_0x90(buf, len);  // 총전압/전류/SOC
-          break;
-        case 0x92:
-          parse_DALY_0x92(buf, len);  // 셀 온도
-          break;
-        case 0x93:
-          parse_DALY_0x93(buf, len);  // 충방전 상태, MOS 상태
-          break;
-        case 0x98:
-          parse_DALY_0x98(buf, len);  // 배터리 오류 상태
-          break;
-        default:
-          Serial.println("Unknown expectedDataId");
-          break;
-      }
-    }
+  const uint32_t err = fdcan1.beginFD(settings, stdFilters, extFilters);
+  if (err != 0) {
+    Serial.print("FDCAN init fail: 0x");
+    Serial.println(err, HEX);
+    while (true) delay(100);
   }
 }
 
 // =====================
-// Parsers
+// Send request
 // =====================
-void parse_DALY_0x90(const uint8_t* buf, uint8_t len) {
+static void requestCAN(uint8_t dataId) {
+  uint8_t payload[8] = {dataId,0,0,0,0,0,0,0};
+
+  CANFDMessage tx;
+  tx.id  = DALY_REQ_ID;
+  tx.ext = true;
+  tx.rtr = false;
+  tx.len = 8;
+  memcpy(tx.data, payload, 8);
+
+  if (!fdcan1.tryToSend(tx)) {
+    Serial.println("TX fail (mailbox full / bus issue)");
+  } else {
+    Serial.print("TX req 0x");
+    Serial.println(dataId, HEX);
+  }
+}
+
+// =====================
+// Receive and handle
+// =====================
+static void receiveAndHandle() {
+  CANFDMessage rx;
+  while (fdcan1.available()) {
+    fdcan1.receive(rx);
+
+    if (!rx.ext) continue;
+    if (rx.id != DALY_RSP_ID) continue;
+    if (rx.len != 8) continue;
+
+    // Always dump raw first (for protocol verification)
+    dumpFrame(rx);
+
+    // Parse using last requested dataId (robust enough for single device test)
+    handleByLastRequest(rx.data, rx.len, lastReqId);
+  }
+}
+
+// =====================
+// RAW dump
+// =====================
+static void dumpFrame(const CANFDMessage &rx) {
+  Serial.print("RX ID=0x");
+  Serial.print(rx.id, HEX);
+  Serial.print(" LEN=");
+  Serial.print(rx.len);
+  Serial.print(" DATA=");
+  for (uint8_t i = 0; i < rx.len; i++) {
+    if (rx.data[i] < 0x10) Serial.print('0');
+    Serial.print(rx.data[i], HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+}
+
+// =====================
+// Parse dispatch
+// NOTE: If your DALY response includes a header byte (e.g., buf[0]=dataId),
+// adjust offsets inside parse functions accordingly.
+// =====================
+static void handleByLastRequest(const uint8_t* buf, uint8_t len, uint8_t expectedDataId) {
+  switch (expectedDataId) {
+    case 0x90: parse_DALY_0x90(buf, len); break;
+    case 0x92: parse_DALY_0x92(buf, len); break;
+    case 0x93: parse_DALY_0x93(buf, len); break;
+    case 0x98: parse_DALY_0x98(buf, len); break;
+    default: break;
+  }
+}
+
+// =====================
+// Parsers (your original logic)
+// =====================
+static void parse_DALY_0x90(const uint8_t* buf, uint8_t len) {
   if (len < 8) return;
 
   float totalV_acc  = ((buf[0] << 8) | buf[1]) * 0.1f;
@@ -175,13 +210,13 @@ void parse_DALY_0x90(const uint8_t* buf, uint8_t len) {
   float current     = (((buf[4] << 8) | buf[5]) - 30000) * 0.1f;
   float soc         = ((buf[6] << 8) | buf[7]) * 0.1f;
 
-  Serial.print("TotalV(acc): ");  Serial.print(totalV_acc);  Serial.print(" V  ");
-  Serial.print("TotalV(real): "); Serial.print(totalV_real); Serial.print(" V  ");
-  Serial.print("Current: ");      Serial.print(current);     Serial.print(" A  ");
-  Serial.print("SOC: ");          Serial.print(soc);         Serial.println(" %");
+  Serial.print("[0x90] TotalV(acc)=");  Serial.print(totalV_acc);  Serial.print("V  ");
+  Serial.print("TotalV(real)=");       Serial.print(totalV_real); Serial.print("V  ");
+  Serial.print("Current=");            Serial.print(current);     Serial.print("A  ");
+  Serial.print("SOC=");                Serial.print(soc);         Serial.println("%");
 }
 
-void parse_DALY_0x92(const uint8_t* buf, uint8_t len) {
+static void parse_DALY_0x92(const uint8_t* buf, uint8_t len) {
   if (len < 4) return;
 
   int8_t  t_max    = (int8_t)buf[0] - 40;
@@ -189,13 +224,13 @@ void parse_DALY_0x92(const uint8_t* buf, uint8_t len) {
   int8_t  t_min    = (int8_t)buf[2] - 40;
   uint8_t t_min_id = buf[3];
 
-  Serial.print("[0x92] Tmax="); Serial.print(t_max); Serial.print("C (#");
+  Serial.print("[0x92] Tmax="); Serial.print(t_max); Serial.print("C(#");
   Serial.print(t_max_id);       Serial.print(")  Tmin=");
-  Serial.print(t_min);          Serial.print("C (#");
+  Serial.print(t_min);          Serial.print("C(#");
   Serial.print(t_min_id);       Serial.println(")");
 }
 
-void parse_DALY_0x93(const uint8_t* buf, uint8_t len) {
+static void parse_DALY_0x93(const uint8_t* buf, uint8_t len) {
   if (len < 4) return;
 
   uint8_t cd_state = buf[0];
@@ -203,84 +238,31 @@ void parse_DALY_0x93(const uint8_t* buf, uint8_t len) {
   bool dsgMOS      = buf[2] != 0;
   uint8_t bms_life = buf[3];
 
-  const char* stateStr = (cd_state == 1) ? "CHG" : (cd_state == 2) ? "DSG" : "IDLE";
+  const char* stateStr = (cd_state == 1) ? "충전" : (cd_state == 2) ? "방전" : "정지";
 
-  Serial.print("[0x93] STATE=");   Serial.print(stateStr);
-  Serial.print("  CHG_MOS=");      Serial.print(chgMOS ? "ON" : "OFF");
-  Serial.print("  DSG_MOS=");      Serial.print(dsgMOS ? "ON" : "OFF");
-  Serial.print("  Life=");         Serial.println(bms_life);
+  Serial.print("[0x93] 상태="); Serial.print(stateStr);
+  Serial.print("  CHG_MOS=");   Serial.print(chgMOS ? "ON" : "OFF");
+  Serial.print("  DSG_MOS=");   Serial.print(dsgMOS ? "ON" : "OFF");
+  Serial.print("  Life=");      Serial.println(bms_life);
 }
 
-void printFlag(const char* name) {
+static void printFlag(const char* name) {
   Serial.print(name);
   Serial.print(" | ");
 }
 
-void parse_DALY_0x98(const uint8_t* buf, uint8_t len) {
+static void parse_DALY_0x98(const uint8_t* buf, uint8_t len) {
   if (len < 8) return;
 
   uint8_t b0 = buf[0];
-  if (b0 & (1<<0)) printFlag("Cell OV Lv1");
-  if (b0 & (1<<1)) printFlag("Cell OV Lv2");
-  if (b0 & (1<<2)) printFlag("Cell UV Lv1");
-  if (b0 & (1<<3)) printFlag("Cell UV Lv2");
-  if (b0 & (1<<4)) printFlag("Pack V High Lv1");
-  if (b0 & (1<<5)) printFlag("Pack V High Lv2");
-  if (b0 & (1<<6)) printFlag("Pack V Low Lv1");
-  if (b0 & (1<<7)) printFlag("Pack V Low Lv2");
-
-  uint8_t b1 = buf[1];
-  if (b1 & (1<<0)) printFlag("Chg Temp High Lv1");
-  if (b1 & (1<<1)) printFlag("Chg Temp High Lv2");
-  if (b1 & (1<<2)) printFlag("Chg Temp Low Lv1");
-  if (b1 & (1<<3)) printFlag("Chg Temp Low Lv2");
-  if (b1 & (1<<4)) printFlag("Dsg Temp High Lv1");
-  if (b1 & (1<<5)) printFlag("Dsg Temp High Lv2");
-  if (b1 & (1<<6)) printFlag("Dsg Temp Low Lv1");
-  if (b1 & (1<<7)) printFlag("Dsg Temp Low Lv2");
-
-  uint8_t b2 = buf[2];
-  if (b2 & (1<<0)) printFlag("Chg OC Lv1");
-  if (b2 & (1<<1)) printFlag("Chg OC Lv2");
-  if (b2 & (1<<2)) printFlag("Dsg OC Lv1");
-  if (b2 & (1<<3)) printFlag("Dsg OC Lv2");
-  if (b2 & (1<<4)) printFlag("SOC High Lv1");
-  if (b2 & (1<<5)) printFlag("SOC High Lv2");
-  if (b2 & (1<<6)) printFlag("SOC Low Lv1");
-  if (b2 & (1<<7)) printFlag("SOC Low Lv2");
-
-  uint8_t b3 = buf[3];
-  if (b3 & (1<<0)) printFlag("Delta P Lv1");
-  if (b3 & (1<<1)) printFlag("Delta P Lv2");
-  if (b3 & (1<<2)) printFlag("Delta T Lv1");
-  if (b3 & (1<<3)) printFlag("Delta T Lv2");
-
-  uint8_t b4 = buf[4];
-  if (b4 & (1<<0)) printFlag("Chg MOS OT");
-  if (b4 & (1<<1)) printFlag("Dsg MOS OT");
-  if (b4 & (1<<2)) printFlag("Chg MOS Sensor Err");
-  if (b4 & (1<<3)) printFlag("Dsg MOS Sensor Err");
-  if (b4 & (1<<4)) printFlag("Chg MOS Stuck");
-  if (b4 & (1<<5)) printFlag("Dsg MOS Stuck");
-  if (b4 & (1<<6)) printFlag("Chg MOS Open");
-  if (b4 & (1<<7)) printFlag("Dsg MOS Open");
-
-  uint8_t b5 = buf[5];
-  if (b5 & (1<<0)) printFlag("AFE Err");
-  if (b5 & (1<<1)) printFlag("Cell Sample Drop");
-  if (b5 & (1<<2)) printFlag("Temp Sensor Err");
-  if (b5 & (1<<3)) printFlag("EEPROM Err");
-  if (b5 & (1<<4)) printFlag("RTC Err");
-  if (b5 & (1<<5)) printFlag("Precharge Fail");
-  if (b5 & (1<<6)) printFlag("Vehicle Comm Err");
-  if (b5 & (1<<7)) printFlag("Internal Comm Err");
-
-  uint8_t b6 = buf[6];
-  if (b6 & (1<<0)) printFlag("Current Module Err");
-  if (b6 & (1<<1)) printFlag("Pack V Module Err");
-  if (b6 & (1<<2)) printFlag("Short Protect Err");
-  if (b6 & (1<<3)) printFlag("UV Charge Forbidden");
-  if (b6 & (1<<4)) printFlag("GPS/SoftSW MOS OFF");
+  if (b0 & (1<<0)) printFlag("셀OV Lv1");
+  if (b0 & (1<<1)) printFlag("셀OV Lv2");
+  if (b0 & (1<<2)) printFlag("셀UV Lv1");
+  if (b0 & (1<<3)) printFlag("셀UV Lv2");
+  if (b0 & (1<<4)) printFlag("총전압 High Lv1");
+  if (b0 & (1<<5)) printFlag("총전압 High Lv2");
+  if (b0 & (1<<6)) printFlag("총전압 Low Lv1");
+  if (b0 & (1<<7)) printFlag("총전압 Low Lv2");
 
   uint8_t errCode = buf[7];
   Serial.print("ERR_CODE=");
