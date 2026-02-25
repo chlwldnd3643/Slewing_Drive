@@ -1,0 +1,493 @@
+import time
+import threading
+import queue
+import random
+from typing import Optional, Tuple
+
+import numpy as np
+import serial
+
+# ==========================
+# FIXED SETTINGS
+# ==========================
+PORT = "COM3"
+UNO_BAUD = 115200
+READ_TIMEOUT = 0.2
+
+CMD_EN = "en"
+CMD_SPD_1000 = "spd 1000"
+
+# 기계적 기어비 기반 정밀 단위 변환 상수
+INC_PER_DEG = (182.0 * 70.0 * 150.0) / 62.0
+
+# 하드웨어의 물리적 주기 (제어기는 설계 도면을 통해 이 주기를 알고 있다고 가정)
+ECC_PERIOD = INC_PER_DEG * (360.0 / 62.0)  # 웜 1회전
+MESH_PERIOD = ECC_PERIOD / 150.0  # 기어 치합 1주기
+
+
+# ==========================
+# 0. 하드웨어 물리적 오차 시뮬레이터 (정답 은닉 블랙박스)
+# ==========================
+class InternalErrorInjector:
+    def __init__(self):
+        self.e1_on = False
+        self.e2_on = False
+        self.e3_on = False
+        self.e4_on = False
+        self.e5_on = False
+
+        self._k_err = 0.0
+        self._m_err = 0.0
+        self._ecc_amp = 0.0
+        self._mesh_amp = 0.0
+        self._backlash = 0.0
+
+        self.prev_cmd = 0.0
+        self.current_dir = 1
+
+    def toggle_e1(self):
+        self.e1_on = not self.e1_on
+        if self.e1_on: self._k_err = random.uniform(-2000.0, 2000.0)
+        return self.e1_on
+
+    def toggle_e2(self):
+        self.e2_on = not self.e2_on
+        if self.e2_on:
+            sign = random.choice([-1.0, 1.0])
+            self._m_err = sign * random.uniform(0.01, 0.05)
+        return self.e2_on
+
+    def toggle_e3(self):
+        self.e3_on = not self.e3_on
+        if self.e3_on: self._ecc_amp = INC_PER_DEG * random.uniform(0.1, 0.3)
+        return self.e3_on
+
+    def toggle_e4(self):
+        self.e4_on = not self.e4_on
+        if self.e4_on: self._mesh_amp = INC_PER_DEG * random.uniform(0.02, 0.05)
+        return self.e4_on
+
+    def toggle_e5(self):
+        self.e5_on = not self.e5_on
+        if self.e5_on: self._backlash = INC_PER_DEG * random.uniform(0.2, 0.5)
+        return self.e5_on
+
+    def apply(self, cmd_val: float, update_state: bool = True) -> float:
+        """하드웨어 작동. update_state=False는 평가판용 유령 스캔"""
+        direction = self.current_dir
+        if cmd_val > self.prev_cmd:
+            direction = 1
+        elif cmd_val < self.prev_cmd:
+            direction = -1
+
+        err = 0.0
+        if self.e1_on: err += self._k_err
+        if self.e2_on: err += (self._m_err * cmd_val)
+        if self.e3_on: err += self._ecc_amp * np.sin(2.0 * np.pi * cmd_val / ECC_PERIOD)
+        if self.e4_on: err += self._mesh_amp * np.sin(2.0 * np.pi * cmd_val / MESH_PERIOD)
+        if self.e5_on: err += (self._backlash / 2.0) if direction >= 0 else -(self._backlash / 2.0)
+
+        if update_state:
+            self.prev_cmd = cmd_val
+            self.current_dir = direction
+
+        return cmd_val + err
+
+
+# ==========================
+# 1. 자가 학습 데이터 기반 보정 제어기 (Real Estimator)
+# ==========================
+class CalibrationFilter:
+    def __init__(self):
+        self.r1_on = False
+        self.r2_on = False
+        self.r3_on = False
+        self.r4_on = False
+        self.r5_on = False
+
+        self.k_est = 0.0
+        self.m_est = 1.0
+        self.ecc_A_est = 0.0
+        self.ecc_B_est = 0.0
+        self.mesh_A_est = 0.0
+        self.mesh_B_est = 0.0
+        self.backlash_est = 0.0
+        self.prev_target = 0.0
+
+    def system_identification(self, targets_cw, actuals_cw, targets_ccw, actuals_ccw):
+        N = len(targets_cw)
+
+        actuals_ccw_aligned = actuals_ccw[::-1]
+        diff = actuals_cw - actuals_ccw_aligned
+        self.backlash_est = np.mean(diff)
+
+        actuals_mid = (actuals_cw + actuals_ccw_aligned) / 2.0
+        coeffs = np.polyfit(targets_cw, actuals_mid, 1)
+        self.m_est = coeffs[0]
+        self.k_est = coeffs[1]
+
+        residuals = actuals_mid - (self.m_est * targets_cw + self.k_est)
+
+        self.ecc_A_est = np.sum(residuals * np.sin(2.0 * np.pi * targets_cw / ECC_PERIOD)) * (2.0 / N)
+        self.ecc_B_est = np.sum(residuals * np.cos(2.0 * np.pi * targets_cw / ECC_PERIOD)) * (2.0 / N)
+
+        res_e4 = residuals - (self.ecc_A_est * np.sin(2.0 * np.pi * targets_cw / ECC_PERIOD) + self.ecc_B_est * np.cos(
+            2.0 * np.pi * targets_cw / ECC_PERIOD))
+
+        self.mesh_A_est = np.sum(res_e4 * np.sin(2.0 * np.pi * targets_cw / MESH_PERIOD)) * (2.0 / N)
+        self.mesh_B_est = np.sum(res_e4 * np.cos(2.0 * np.pi * targets_cw / MESH_PERIOD)) * (2.0 / N)
+
+    def pre_compensate(self, target: float) -> float:
+        cmd = target
+        direction = 1 if target >= self.prev_target else -1
+
+        if self.r5_on: cmd -= (self.backlash_est / 2.0) * direction
+        if self.r4_on: cmd -= (self.mesh_A_est * np.sin(2.0 * np.pi * target / MESH_PERIOD) + self.mesh_B_est * np.cos(
+            2.0 * np.pi * target / MESH_PERIOD))
+        if self.r3_on: cmd -= (self.ecc_A_est * np.sin(2.0 * np.pi * target / ECC_PERIOD) + self.ecc_B_est * np.cos(
+            2.0 * np.pi * target / ECC_PERIOD))
+        if self.r1_on: cmd -= self.k_est
+        if self.r2_on: cmd /= self.m_est
+
+        self.prev_target = target
+        return cmd
+
+    def evaluate(self, target: float, raw_actual: float, comp_actual: float) -> Tuple[float, float, float, float]:
+        err_pre = abs(raw_actual - target)
+        err_post = abs(comp_actual - target)
+
+        imp = 0.0
+        if err_pre > 2.0:
+            imp = (1.0 - (err_post / err_pre)) * 100.0
+        elif err_pre <= 2.0 and err_post <= 2.0:
+            imp = 100.0
+
+        err_rate_cmd = (err_post / abs(target)) * 100.0 if abs(target) > 0.001 else 0.0
+        return err_pre, err_post, imp, err_rate_cmd
+
+
+# ==========================
+# 2. 시리얼 클라이언트 & 출력 필터링
+# ==========================
+def is_garbage_line(line: str) -> bool:
+    garbage_keywords = ["=== Kinco", "cmd: en, rst", "Capture:", "[FILT]", "EMA1", "EMA2", "ema fc", "ema a"]
+    for kw in garbage_keywords:
+        if kw in line: return True
+    return False
+
+
+class ArduinoClient:
+    def __init__(self, port: str, baud: int = UNO_BAUD, timeout: float = READ_TIMEOUT):
+        self.port = port
+        self.baud = baud
+        self.timeout = timeout
+        self.ser = None
+        self._rx_thread = None
+        self._stop_evt = threading.Event()
+        self._lines = queue.Queue(maxsize=8000)
+        self._log_thread = None
+        self._log_stop_evt = threading.Event()
+        self._log_enabled = False
+
+        self.cal = CalibrationFilter()
+        self.inj = InternalErrorInjector()
+
+    def open(self):
+        self.ser = serial.Serial(self.port, self.baud, timeout=self.timeout)
+        time.sleep(1.5)
+        self._stop_evt.clear()
+        self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
+        self._rx_thread.start()
+
+    def close(self):
+        self.shutdown_logging()
+        self._stop_evt.set()
+        if self._rx_thread: self._rx_thread.join(timeout=1.0)
+        if self.ser and self.ser.is_open: self.ser.close()
+
+    def send(self, cmd: str):
+        if not self.ser or not self.ser.is_open: return
+        self.ser.write((cmd.strip() + "\n").encode("utf-8", errors="ignore"))
+        self.ser.flush()
+
+    def _rx_loop(self):
+        buf = b""
+        while not self._stop_evt.is_set():
+            try:
+                chunk = self.ser.read(512)
+            except:
+                break
+            if not chunk: continue
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = line.replace(b"\r", b"").decode("utf-8", errors="replace").strip()
+                if text:
+                    try:
+                        self._lines.put_nowait(text)
+                    except queue.Full:
+                        pass
+
+    def read_line(self, timeout_s: float = 0.5) -> Optional[str]:
+        try:
+            return self._lines.get(timeout=timeout_s)
+        except queue.Empty:
+            return None
+
+    @staticmethod
+    def parse_dual_value(line: str) -> Optional[Tuple[float, float]]:
+        if ',' in line:
+            try:
+                parts = line.split(',')
+                return float(parts[0]), float(parts[1])
+            except ValueError:
+                pass
+        return None
+
+    def read_status_burst(self, seconds: float = 1.0):
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < seconds:
+            line = self.read_line(timeout_s=0.05)
+            if not line: continue
+            if is_garbage_line(line): continue
+            if self.parse_dual_value(line.strip()) is None:
+                print(line.strip())
+
+    def start_logging(self):
+        self._log_enabled = True
+        if self._log_thread and self._log_thread.is_alive(): return
+        self._log_stop_evt.clear()
+
+        def _printer():
+            print(
+                f"\n{'Target(목표)':>12} | {'Raw_Act(미보정)':>15} | {'Cmd(사전왜곡)':>15} | {'Actual(실제도달)':>16} | {'Err_Pre':>8} | {'Err_Post':>8} | {'%Err':>7} | {'Imp%':>6} | {'Status'}")
+            print("-" * 125)
+
+            while not self._log_stop_evt.is_set():
+                if not self._log_enabled:
+                    time.sleep(0.05)
+                    continue
+                line = self.read_line(timeout_s=0.2)
+                if not line: continue
+                if is_garbage_line(line): continue
+
+                dual = self.parse_dual_value(line)
+                if dual:
+                    _, n_raw = dual
+                    target = n_raw
+
+                    # 1. 시뮬레이터 꼬임 방지를 위해 유령 스캔 (모터 상태 변화 안함)
+                    raw_actual = self.inj.apply(target, update_state=False)
+
+                    # 2. 보정 후 실제 전송 및 상태 갱신
+                    comp_cmd = self.cal.pre_compensate(target)
+                    actual_val = self.inj.apply(comp_cmd, update_state=True)
+
+                    ep, ea, imp, err_rate = self.cal.evaluate(target, raw_actual, actual_val)
+                    rate_str = f"{err_rate:7.4f}%" if abs(target) > 0.001 else "   N/A   "
+
+                    e_str = "".join([str(i + 1) if on else "-" for i, on in enumerate(
+                        [self.inj.e1_on, self.inj.e2_on, self.inj.e3_on, self.inj.e4_on, self.inj.e5_on])])
+                    r_str = "".join([str(i + 1) if on else "-" for i, on in enumerate(
+                        [self.cal.r1_on, self.cal.r2_on, self.cal.r3_on, self.cal.r4_on, self.cal.r5_on])])
+
+                    print(
+                        f"{target:12.1f} | {raw_actual:15.1f} | {comp_cmd:15.1f} | {actual_val:16.1f} | {ep:8.1f} | {ea:8.1f} | {rate_str:>7} | {imp:6.1f}% | [E:{e_str} R:{r_str}]")
+                else:
+                    print(f"[MSG] {line}")
+
+        self._log_thread = threading.Thread(target=_printer, daemon=True)
+        self._log_thread.start()
+
+    def stop_logging(self):
+        self._log_enabled = False
+
+    def shutdown_logging(self):
+        self._log_stop_evt.set()
+        if self._log_thread:
+            self._log_thread.join(timeout=1.0)
+            self._log_thread = None
+        self._log_enabled = False
+
+    def _drain_queue(self):
+        try:
+            while True: self._lines.get_nowait()
+        except queue.Empty:
+            pass
+
+
+# ==========================
+# 3. 메인 인터페이스 (CLI)
+# ==========================
+def print_help_menu():
+    print("\n======= COMMANDS =======")
+    print("  en            -> 모터 활성화")
+    print("  unit          -> 입력 모드 토글 (현재 기본값: 각도 Degree)")
+    print("  abs <val>     -> 절대 위치 이동")
+    print("  --- 5대 기계 결함 주입 (Error Injectors) ---")
+    print("  e1 : 영점 오프셋   e2 : 스케일 오차    e3 : 기어 편심")
+    print("  e4 : 치합 오차     e5 : 방향성 백래시")
+    print("  --- 5대 전담 보정기 (Compensators) ---")
+    print("  cal           -> ★필수★ [System ID] 10만 포인트 스캔으로 오차 학습!")
+    print("  r1 : 오프셋 보정   r2 : 스케일 보정    r3 : 편심 노이즈 캔슬링")
+    print("  r4 : 치합 캔슬링   r5 : 백래시 보상")
+    print("  --- 모니터링 ---")
+    print("  p             -> [PDO 피드백] 실시간 모니터링 ON/OFF")
+    print("  q             -> 프로그램 종료")
+    print("========================\n")
+
+
+def interactive_main():
+    print(f"[{PORT}] System ID 완전 구현! 5:5 듀얼 제어 시뮬레이터 시작...")
+    cli = ArduinoClient(port=PORT, baud=UNO_BAUD, timeout=READ_TIMEOUT)
+    try:
+        cli.open()
+    except Exception as e:
+        print(f"포트 연결 실패: {e}\n하드웨어 연결을 확인하세요.")
+        return
+
+    input_unit = "deg"
+    print_help_menu()
+
+    try:
+        while True:
+            cmd = input(f"({input_unit})> ").strip().lower()
+            if not cmd: continue
+
+            if cmd in ("q", "quit", "exit"):
+                break
+            elif cmd in ("h", "help", "?"):
+                print_help_menu()
+
+            elif cmd == "unit":
+                if input_unit == "inc":
+                    input_unit = "deg"
+                    print(f"[설정] 각도(Degree) 모드 (1도 = {INC_PER_DEG:.4f} inc)")
+                else:
+                    input_unit = "inc"
+                    print("[설정] 인크리먼트(Increment) 모드")
+
+            elif cmd.startswith("abs ") or cmd.startswith("rel "):
+                parts = cmd.split()
+                if len(parts) >= 2:
+                    try:
+                        cmd_type = parts[0]
+                        user_val = float(parts[1])
+
+                        target_val = user_val * INC_PER_DEG if input_unit == "deg" else user_val
+
+                        # 평가판용 유령 스캔 (모터 방향성 유지)
+                        raw_actual = cli.inj.apply(target_val, update_state=False)
+
+                        comp_cmd = cli.cal.pre_compensate(target_val)
+                        actual_val = cli.inj.apply(comp_cmd, update_state=True)
+
+                        ep, ea, imp, err_rate = cli.cal.evaluate(target_val, raw_actual, actual_val)
+
+                        final_cmd = f"{cmd_type} {int(comp_cmd)}"
+                        cli.send(final_cmd)
+
+                        print(f"\n[SDO 지령 전송] {cmd_type.upper()} 제어")
+                        print(f" - 타겟(Target): {target_val:.1f} inc")
+                        print(f" - 사전왜곡 지령: {comp_cmd:.1f} inc")
+                        print(f" - 도달 위치    : {actual_val:.1f} inc (보정 잔류오차: {ea:.1f})")
+                        rate_str = f"{err_rate:.4f}%" if abs(target_val) > 0.001 else "N/A"
+                        print(f" -> 물리적 송신 : '{final_cmd}' | %Err: {rate_str} | 개선율: {imp:.1f}%\n")
+
+                        cli.read_status_burst(seconds=0.6)
+                    except ValueError:
+                        print("올바른 숫자를 입력하세요.")
+
+            elif cmd == "cal":
+                print("\n[System ID] 실제 모터를 -360도 ~ +360도로 정/역회전하며 데이터를 수집합니다...")
+
+                # [BUG FIX] 5000개 -> 100,000개로 대폭 늘려 고주파(e4) 진동까지 나이퀴스트 스캔!
+                targets_cw = np.linspace(-360 * INC_PER_DEG, 360 * INC_PER_DEG, 100000)
+                actuals_cw = np.array([cli.inj.apply(t, update_state=True) for t in targets_cw])
+
+                targets_ccw = np.linspace(360 * INC_PER_DEG, -360 * INC_PER_DEG, 100000)
+                actuals_ccw = np.array([cli.inj.apply(t, update_state=True) for t in targets_ccw])
+
+                print("[분석 중] 수집된 200,000개 초고해상도 데이터로 푸리에(FFT) 분석 진행 중...")
+
+                cli.cal.system_identification(targets_cw, actuals_cw, targets_ccw, actuals_ccw)
+
+                print("\n[캘리브레이션 완료] 제어기의 블라인드 추정 결과:")
+                print(
+                    f" - E1 (Offset)   : 추정값 {cli.cal.k_est:8.1f} | 정답 {cli.inj._k_err if cli.inj.e1_on else 0.0:8.1f}")
+                print(
+                    f" - E2 (Scale)    : 추정값 {cli.cal.m_est:8.5f} | 정답 {1.0 + cli.inj._m_err if cli.inj.e2_on else 1.0:8.5f}")
+
+                ecc_amp_est = np.sqrt(cli.cal.ecc_A_est ** 2 + cli.cal.ecc_B_est ** 2)
+                mesh_amp_est = np.sqrt(cli.cal.mesh_A_est ** 2 + cli.cal.mesh_B_est ** 2)
+
+                print(
+                    f" - E3 (Ecc Amp)  : 추정값 {ecc_amp_est:8.1f} | 정답 {cli.inj._ecc_amp if cli.inj.e3_on else 0.0:8.1f}")
+                print(
+                    f" - E4 (Mesh Amp) : 추정값 {mesh_amp_est:8.1f} | 정답 {cli.inj._mesh_amp if cli.inj.e4_on else 0.0:8.1f}")
+                print(
+                    f" - E5 (Backlash) : 추정값 {cli.cal.backlash_est:8.1f} | 정답 {cli.inj._backlash if cli.inj.e5_on else 0.0:8.1f}\n")
+
+            elif cmd == "en":
+                cli._drain_queue()
+                cli.send(CMD_EN)
+                time.sleep(0.05)
+                cli.send(CMD_SPD_1000)
+                print("Sent: en + spd 1000. Status:")
+                cli.read_status_burst(seconds=1.2)
+
+            # --- E 토글 ---
+            elif cmd == "e1":
+                print(f"[E1] 오프셋 오차 -> {'ON' if cli.inj.toggle_e1() else 'OFF'}")
+            elif cmd == "e2":
+                print(f"[E2] 스케일 오차 -> {'ON' if cli.inj.toggle_e2() else 'OFF'}")
+            elif cmd == "e3":
+                print(f"[E3] 편심 오차 -> {'ON' if cli.inj.toggle_e3() else 'OFF'}")
+            elif cmd == "e4":
+                print(f"[E4] 치합 오차 -> {'ON' if cli.inj.toggle_e4() else 'OFF'}")
+            elif cmd == "e5":
+                print(f"[E5] 백래시 유격 -> {'ON' if cli.inj.toggle_e5() else 'OFF'}")
+
+                # --- R 토글 ---
+            elif cmd == "r1":
+                cli.cal.r1_on = not cli.cal.r1_on
+                print(f"[R1] 데이터 기반 오프셋 보상기 -> {'ON' if cli.cal.r1_on else 'OFF'}")
+
+            elif cmd == "r2":
+                cli.cal.r2_on = not cli.cal.r2_on
+                print(f"[R2] 데이터 기반 스케일 보상기 -> {'ON' if cli.cal.r2_on else 'OFF'}")
+
+            elif cmd == "r3":
+                cli.cal.r3_on = not cli.cal.r3_on
+                print(f"[R3] 편심 노이즈 캔슬링 -> {'ON' if cli.cal.r3_on else 'OFF'}")
+
+            elif cmd == "r4":
+                cli.cal.r4_on = not cli.cal.r4_on
+                print(f"[R4] 치합 노이즈 캔슬링 -> {'ON' if cli.cal.r4_on else 'OFF'}")
+
+            elif cmd == "r5":
+                cli.cal.r5_on = not cli.cal.r5_on
+                print(f"[R5] 백래시 역보상 -> {'ON' if cli.cal.r5_on else 'OFF'}")
+
+            elif cmd == "p":
+                if cli._log_enabled:
+                    cli.stop_logging()
+                    print("[INFO] PDO 모니터링 OFF")
+                else:
+                    cli._drain_queue()
+                    cli.start_logging()
+                    print("[INFO] PDO 모니터링 ON")
+
+            else:
+                cli.send(cmd)
+                print("Sent. Status:")
+                cli.read_status_burst(seconds=0.6)
+
+    finally:
+        cli.stop_logging()
+        cli.close()
+        print("시스템 종료.")
+
+
+if __name__ == "__main__":
+    interactive_main()
