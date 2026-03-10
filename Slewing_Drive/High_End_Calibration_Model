@@ -7,13 +7,18 @@ from typing import Optional, Tuple
 import numpy as np
 import serial
 
-# ==========================
-# FIXED SETTINGS
-# ==========================
-PORT = "COM3"
-UNO_BAUD = 115200
-READ_TIMEOUT = 0.2
+# =========================================================
+# SERIAL PORT SETTINGS
+# =========================================================
+COM_HANDLE = "COM4"   # 핸들 Arduino (AS5600 -> Sxxx 전송)
+COM_SLEW   = "COM3"   # 슬루잉 드라이브 제어 Arduino
+BAUD_HANDLE = 57600
+BAUD_SLEW   = 115200
+READ_TIMEOUT = 0.05
 
+# =========================================================
+# DRIVE / KINEMATIC SETTINGS
+# =========================================================
 CMD_EN = "en"
 CMD_SPD_1000 = "spd 1000"
 
@@ -21,28 +26,32 @@ INC_PER_DEG = (182.0 * 70.0 * 150.0) / 62.0
 ECC_PERIOD = INC_PER_DEG * (360.0 / 62.0)
 MESH_PERIOD = ECC_PERIOD / 150.0
 
-# ==========================
-# 핵심 동작 모드
-# ==========================
+# 핸들 -1000 ~ +1000 을 몇 도로 볼지
+MAX_HANDLE_DEG = 90.0
+
+# 제어 주기 제한
+SEND_INTERVAL_SEC = 0.03
+
 # True:
-#   - abs 90 입력 시, "예측 도달 위치"를 그대로 abs로 전송
-#   - 보정 OFF => raw_pred로 이동
-#   - 보정 ON  => comp_pred로 이동
+#   - 보정 OFF: 오염된 각도를 실제 슬루잉 드라이브 출력각으로 만듦
+#   - 보정 ON : 보정된 최종 예상 출력각으로 감
 #
 # False:
-#   - 보정 OFF => target 그대로 전송
-#   - 보정 ON  => comp_cmd 전송 (정석 보정: 목표 90에 가게 하는 방식)
+#   - 보정 OFF: 목표각 그대로 전송
+#   - 보정 ON : 보정명령(comp_cmd)을 전송
 MOVE_TO_PREDICTED = True
 
 
-# ==========================
-# 0. 하드웨어 물리적 오차 시뮬레이터
-# ==========================
+# =========================================================
+# ERROR INJECTOR
+# =========================================================
 class InternalErrorInjector:
     """
-    E1: 통합 선형 오차 y = a*x + b
-        - 90deg 기준 오차율 15~25% 되도록 a를 설정
-        - b=0 고정 => 90deg 오차율이 항상 15~25% 범위
+    E1: 선형 오차 y = a*x + b
+    E3: 편심성 사인 오차
+    E4: 기어 메쉬 오차
+    E5: 백래시
+    E6: 누적 슬립
     """
     def __init__(self):
         self.e1_on = False
@@ -51,16 +60,13 @@ class InternalErrorInjector:
         self.e5_on = False
         self.e6_on = False
 
-        # E1(ax+b)
         self._a_err = 1.0
         self._b_err = 0.0
 
-        # E3~E5
         self._ecc_amp = 0.0
         self._mesh_amp = 0.0
         self._backlash = 0.0
 
-        # E6
         self._e6_cw_ratio = 0.0
         self._e6_ccw_ratio = 0.0
         self._accumulated_e6_err = 0.0
@@ -114,7 +120,6 @@ class InternalErrorInjector:
 
         err = 0.0
 
-        # E1: y = a*x + b  => err = (a*x + b) - x
         if self.e1_on:
             err += (self._a_err * cmd_val + self._b_err) - cmd_val
 
@@ -127,7 +132,6 @@ class InternalErrorInjector:
         if self.e5_on:
             err += (self._backlash / 2.0) if direction >= 0 else -(self._backlash / 2.0)
 
-        # E6 누적 슬립
         e6_step_err = 0.0
         if self.e6_on:
             if delta >= 0:
@@ -147,21 +151,21 @@ class InternalErrorInjector:
         return cmd_val + err
 
 
-# ==========================
-# 1. 자가 학습 보정 제어기
-# ==========================
+# =========================================================
+# CALIBRATION FILTER
+# =========================================================
 class CalibrationFilter:
     def __init__(self):
-        self.r1_on = False  # b
-        self.r2_on = False  # a
+        self.r1_on = False
+        self.r2_on = False
         self.r3_on = False
         self.r4_on = False
         self.r5_on = False
         self.r6_on = False
         self.r7_on = False
 
-        self.k_est = 0.0     # b 추정
-        self.m_est = 1.0     # a 추정
+        self.k_est = 0.0
+        self.m_est = 1.0
 
         self.ecc_A_est = 0.0
         self.ecc_B_est = 0.0
@@ -208,7 +212,6 @@ class CalibrationFilter:
 
         delta_cmd = delta_target
 
-        # E6 보정
         if self.r7_on:
             if delta_target >= 0:
                 delta_cmd = delta_target / (1.0 + self.e6_cw_ratio_est)
@@ -241,7 +244,6 @@ class CalibrationFilter:
                 self.ecc_B_est * np.cos(2.0 * np.pi * target / ECC_PERIOD)
             )
 
-        # 선형 보정: cmd = (target - b)/a
         if self.r1_on:
             cmd -= self.k_est
         if self.r2_on:
@@ -251,49 +253,27 @@ class CalibrationFilter:
         self.prev_r7_cmd = base_cmd
         return cmd
 
-    def evaluate(self, target: float, raw_pred: float, comp_pred: float) -> Tuple[float, float, float, float, float]:
-        err_pre = abs(raw_pred - target)
-        err_post = abs(comp_pred - target)
 
-        imp = 0.0
-        if err_pre > 2.0:
-            imp = (1.0 - (err_post / err_pre)) * 100.0
-        elif err_pre <= 2.0 and err_post <= 2.0:
-            imp = 100.0
-
-        err_rate_pre = (err_pre / abs(target)) * 100.0 if abs(target) > 0.001 else 0.0
-        err_rate_post = (err_post / abs(target)) * 100.0 if abs(target) > 0.001 else 0.0
-
-        return err_pre, err_post, imp, err_rate_pre, err_rate_post
-
-
-# ==========================
-# 2. 시리얼 클라이언트 & 출력 필터링
-# ==========================
-def is_garbage_line(line: str) -> bool:
-    garbage_keywords = ["=== Kinco", "cmd: en, rst", "Capture:", "[FILT]", "EMA1", "EMA2", "ema fc", "ema a"]
-    return any(kw in line for kw in garbage_keywords)
-
-
-class ArduinoClient:
-    def __init__(self, port: str, baud: int = UNO_BAUD, timeout: float = READ_TIMEOUT):
+# =========================================================
+# HANDLE SERIAL READER
+# =========================================================
+class HandleSerialReader:
+    """
+    핸들 Arduino가 보내는 라인:
+      S0
+      S-523
+      S1000
+    """
+    def __init__(self, port: str, baud: int, timeout: float = READ_TIMEOUT):
         self.port = port
         self.baud = baud
         self.timeout = timeout
-        self.ser = None
 
+        self.ser = None
         self._rx_thread = None
         self._stop_evt = threading.Event()
-        self._lines = queue.Queue(maxsize=8000)
-
-        self._log_thread = None
-        self._log_stop_evt = threading.Event()
-        self._log_enabled = False
-
-        self.status_unit = "deg"
-
-        self.cal = CalibrationFilter()
-        self.inj = InternalErrorInjector()
+        self._latest_cmd = 0
+        self._lock = threading.Lock()
 
     def open(self):
         self.ser = serial.Serial(self.port, self.baud, timeout=self.timeout)
@@ -303,10 +283,63 @@ class ArduinoClient:
         self._rx_thread.start()
 
     def close(self):
-        self.shutdown_logging()
         self._stop_evt.set()
         if self._rx_thread:
             self._rx_thread.join(timeout=1.0)
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+
+    def _rx_loop(self):
+        buf = b""
+        while not self._stop_evt.is_set():
+            try:
+                chunk = self.ser.read(128)
+            except Exception:
+                break
+            if not chunk:
+                continue
+
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = line.replace(b"\r", b"").decode("utf-8", errors="ignore").strip()
+                if text.startswith("S"):
+                    try:
+                        v = int(text[1:])
+                        v = max(-1000, min(1000, v))
+                        with self._lock:
+                            self._latest_cmd = v
+                    except ValueError:
+                        pass
+
+    def get_latest_handle_cmd(self) -> int:
+        with self._lock:
+            return self._latest_cmd
+
+    def get_latest_handle_deg(self) -> float:
+        cmd = self.get_latest_handle_cmd()
+        return (cmd / 1000.0) * MAX_HANDLE_DEG
+
+    def get_latest_target_inc(self) -> float:
+        deg = self.get_latest_handle_deg()
+        return deg * INC_PER_DEG
+
+
+# =========================================================
+# SLEW DRIVE SERIAL CLIENT
+# =========================================================
+class SlewSerialClient:
+    def __init__(self, port: str, baud: int, timeout: float = READ_TIMEOUT):
+        self.port = port
+        self.baud = baud
+        self.timeout = timeout
+        self.ser = None
+
+    def open(self):
+        self.ser = serial.Serial(self.port, self.baud, timeout=self.timeout)
+        time.sleep(1.5)
+
+    def close(self):
         if self.ser and self.ser.is_open:
             self.ser.close()
 
@@ -316,318 +349,231 @@ class ArduinoClient:
         self.ser.write((cmd.strip() + "\n").encode("utf-8", errors="ignore"))
         self.ser.flush()
 
-    def _rx_loop(self):
-        buf = b""
-        while not self._stop_evt.is_set():
-            try:
-                chunk = self.ser.read(512)
-            except Exception:
-                break
-            if not chunk:
-                continue
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                text = line.replace(b"\r", b"").decode("utf-8", errors="replace").strip()
-                if text:
-                    try:
-                        self._lines.put_nowait(text)
-                    except queue.Full:
-                        pass
-
-    def read_line(self, timeout_s: float = 0.5) -> Optional[str]:
-        try:
-            return self._lines.get(timeout=timeout_s)
-        except queue.Empty:
-            return None
-
-    @staticmethod
-    def parse_dual_value(line: str) -> Optional[Tuple[float, float]]:
-        if "," in line:
-            try:
-                parts = line.split(",")
-                return float(parts[0]), float(parts[1])
-            except ValueError:
-                return None
-        return None
-
-    def read_status_burst(self, seconds: float = 1.0):
+    def read_lines(self, seconds: float = 0.3):
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < seconds:
-            line = self.read_line(timeout_s=0.05)
-            if not line:
-                continue
-            if is_garbage_line(line):
-                continue
-            if self.parse_dual_value(line.strip()) is None:
-                print(line.strip())
+            try:
+                line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                break
+            if line:
+                print(f"[SLEW] {line}")
 
-    def _drain_queue(self):
-        try:
-            while True:
-                self._lines.get_nowait()
-        except queue.Empty:
-            pass
 
-    def start_logging(self):
-        self._log_enabled = True
-        if self._log_thread and self._log_thread.is_alive():
+# =========================================================
+# MAIN CONTROLLER
+# =========================================================
+class SteeringBridgeSystem:
+    def __init__(self):
+        self.handle = HandleSerialReader(COM_HANDLE, BAUD_HANDLE, READ_TIMEOUT)
+        self.slew = SlewSerialClient(COM_SLEW, BAUD_SLEW, READ_TIMEOUT)
+
+        self.inj = InternalErrorInjector()
+        self.cal = CalibrationFilter()
+
+        self.status_unit = "deg"
+        self.running = False
+        self.ctrl_thread = None
+        self.last_send_time = 0.0
+        self.last_sent_abs = None
+
+    def open(self):
+        self.handle.open()
+        self.slew.open()
+
+    def close(self):
+        self.stop_rt()
+        self.handle.close()
+        self.slew.close()
+
+    def enable_drive(self):
+        self.slew.send(CMD_EN)
+        time.sleep(0.05)
+        self.slew.send(CMD_SPD_1000)
+        print("[INFO] Sent: en + spd 1000")
+
+    def toggle_rt(self):
+        if self.running:
+            self.stop_rt()
+            print("[INFO] 실시간 추종 OFF")
+        else:
+            self.start_rt()
+            print("[INFO] 실시간 추종 ON")
+
+    def start_rt(self):
+        if self.running:
             return
-        self._log_stop_evt.clear()
+        self.running = True
+        self.ctrl_thread = threading.Thread(target=self._control_loop, daemon=True)
+        self.ctrl_thread.start()
 
-        def _printer():
-            last_printed_unit = None
-            while not self._log_stop_evt.is_set():
-                if not self._log_enabled:
-                    time.sleep(0.05)
-                    continue
+    def stop_rt(self):
+        self.running = False
+        if self.ctrl_thread:
+            self.ctrl_thread.join(timeout=1.0)
+            self.ctrl_thread = None
 
-                if last_printed_unit != self.status_unit:
-                    last_printed_unit = self.status_unit
-                    u_str = "Deg" if self.status_unit == "deg" else "Inc"
-                    print(
-                        f"\n{'Target':>12} | {'RawPred':>14} | {'CompCmd':>14} | {'CompPred':>14} | "
-                        f"{f'원래오차({u_str})':>13} | {f'남은오차({u_str})':>13} | {'원래%Err':>8} | {'남은%Err':>8} | {'Imp%':>6} | {'E/R'}"
-                    )
-                    print("-" * 140)
+    def _control_loop(self):
+        print(
+            f"\n{'HandleDeg':>10} | {'IdealDeg':>10} | {'RawPredDeg':>11} | "
+            f"{'CompCmdDeg':>11} | {'CompPredDeg':>12} | {'SentAbsDeg':>11} | {'Mode':>8}"
+        )
+        print("-" * 92)
 
-                line = self.read_line(timeout_s=0.2)
-                if not line or is_garbage_line(line):
-                    continue
+        while self.running:
+            target_inc = self.handle.get_latest_target_inc()
+            handle_deg = self.handle.get_latest_handle_deg()
+            target_deg = target_inc / INC_PER_DEG
 
-                dual = self.parse_dual_value(line)
-                if not dual:
-                    continue
+            raw_pred_inc = self.inj.apply(target_inc, update_state=False)
+            comp_cmd_inc = self.cal.pre_compensate(target_inc)
+            comp_pred_inc = self.inj.apply(comp_cmd_inc, update_state=False)
 
-                _, n_raw = dual
-                target = n_raw
+            # 보정 OFF:
+            #   오염된 각도가 실제 슬루잉 드라이브 각도
+            # 보정 ON:
+            #   보정 후 예상되는 출력 각도를 실제 슬루잉 드라이브 각도로 사용
+            if MOVE_TO_PREDICTED:
+                desired_inc = comp_pred_inc if self.cal.any_comp_on() else raw_pred_inc
+                send_inc = int(round(desired_inc))
+                mode_str = "PRED"
+            else:
+                send_inc = int(round(comp_cmd_inc)) if self.cal.any_comp_on() else int(round(target_inc))
+                mode_str = "CMD"
 
-                raw_pred = self.inj.apply(target, update_state=False)
-                comp_cmd = self.cal.pre_compensate(target)
-                comp_pred = self.inj.apply(comp_cmd, update_state=False)
+            now = time.perf_counter()
 
-                ep, ea, imp, err_rate_pre, err_rate_post = self.cal.evaluate(target, raw_pred, comp_pred)
+            # 불필요한 연속 전송 방지
+            need_send = False
+            if self.last_sent_abs is None:
+                need_send = True
+            elif abs(send_inc - self.last_sent_abs) >= int(0.2 * INC_PER_DEG):  # 약 0.2도 이상 변할 때만
+                need_send = True
+            elif (now - self.last_send_time) >= 0.2:
+                need_send = True
 
-                div = INC_PER_DEG if self.status_unit == "deg" else 1.0
-                fmt = "12.3f" if self.status_unit == "deg" else "12.1f"
+            if need_send and (now - self.last_send_time) >= SEND_INTERVAL_SEC:
+                self.slew.send(f"abs {send_inc}")
+                self.last_sent_abs = send_inc
+                self.last_send_time = now
 
-                e_flags = [self.inj.e1_on, self.inj.e3_on, self.inj.e4_on, self.inj.e5_on, self.inj.e6_on]
-                e_labels = ["1", "3", "4", "5", "6"]
-                e_str = "".join([lab if on else "-" for lab, on in zip(e_labels, e_flags)])
+                # 상태 업데이트
+                _ = self.inj.apply(float(send_inc), update_state=True)
 
-                r_flags = [self.cal.r1_on, self.cal.r2_on, self.cal.r3_on, self.cal.r4_on, self.cal.r5_on, self.cal.r6_on, self.cal.r7_on]
-                r_labels = ["1", "2", "3", "4", "5", "6", "7"]
-                r_str = "".join([lab if on else "-" for lab, on in zip(r_labels, r_flags)])
+            raw_pred_deg = raw_pred_inc / INC_PER_DEG
+            comp_cmd_deg = comp_cmd_inc / INC_PER_DEG
+            comp_pred_deg = comp_pred_inc / INC_PER_DEG
+            sent_deg = send_inc / INC_PER_DEG
 
-                print(
-                    f"{(target/div):{fmt}} | {(raw_pred/div):14.3f} | {(comp_cmd/div):14.3f} | {(comp_pred/div):14.3f} | "
-                    f"{(ep/div):13.3f} | {(ea/div):13.3f} | {err_rate_pre:7.3f}% | {err_rate_post:7.3f}% | {imp:6.1f}% | [{e_str}/{r_str}]"
-                )
+            print(
+                f"{handle_deg:10.3f} | {target_deg:10.3f} | {raw_pred_deg:11.3f} | "
+                f"{comp_cmd_deg:11.3f} | {comp_pred_deg:12.3f} | {sent_deg:11.3f} | {mode_str:>8}"
+            )
 
-        self._log_thread = threading.Thread(target=_printer, daemon=True)
-        self._log_thread.start()
+            time.sleep(0.05)
 
-    def stop_logging(self):
-        self._log_enabled = False
+    def calibrate_from_model(self):
+        print("\n[cal] 오차 모델 기반 학습 시작...")
+        targets_cw = np.linspace(-MAX_HANDLE_DEG * INC_PER_DEG, MAX_HANDLE_DEG * INC_PER_DEG, 3000)
+        actuals_cw = np.array([self.inj.apply(t, update_state=False) for t in targets_cw])
+        targets_ccw = np.linspace(MAX_HANDLE_DEG * INC_PER_DEG, -MAX_HANDLE_DEG * INC_PER_DEG, 3000)
+        actuals_ccw = np.array([self.inj.apply(t, update_state=False) for t in targets_ccw])
 
-    def shutdown_logging(self):
-        self._log_stop_evt.set()
-        if self._log_thread:
-            self._log_thread.join(timeout=1.0)
-            self._log_thread = None
-        self._log_enabled = False
+        self.cal.system_identification(targets_cw, actuals_cw, targets_ccw, actuals_ccw)
+
+        print("[완료] 학습 완료")
+        print(f" - a_est = {self.cal.m_est:.6f}")
+        print(f" - b_est = {self.cal.k_est:.3f} inc")
+        print(f" - backlash_est = {self.cal.backlash_est:.3f} inc")
 
 
-# ==========================
-# 3. CLI
-# ==========================
-def print_help_menu():
+# =========================================================
+# CLI
+# =========================================================
+def print_help():
     print("\n======= COMMANDS =======")
-    print("  abs <val>     -> 절대 위치 이동")
-    print("  unit          -> [입력] 단위 변경 (deg/inc)")
-    print("  status_unit   -> [출력] 단위 변경 (deg/inc)")
-    print("  --- Errors ---")
-    print("  e1            -> 선형 오차 y=ax+b (90deg 기준 15~25%)")
-    print("  e3/e4/e5/e6   -> 기타 오차")
-    print("  --- Cal/Comp ---")
-    print("  cal           -> 선형/파동/백래시 스캔")
-    print("  cal2          -> e6 ratio 추론")
-    print("  r1~r7         -> 보정 토글")
-    print("  p             -> 모니터링 ON/OFF")
-    print("  en            -> enable + spd 1000")
-    print("  q             -> 종료")
+    print("  en          -> 슬루잉 드라이브 enable + spd 1000")
+    print("  rt          -> 핸들 실시간 추종 ON/OFF")
+    print("  cal         -> 현재 오차모델 기준 보정 파라미터 학습")
+    print("  e1/e3/e4/e5/e6  -> 오염 토글")
+    print("  r1~r7       -> 보정 토글")
+    print("  q           -> 종료")
     print("========================\n")
 
 
-def interactive_main():
-    print(f"[{PORT}] '예측값으로 실제 이동' 모드 시작 (MOVE_TO_PREDICTED={MOVE_TO_PREDICTED})")
-    cli = ArduinoClient(port=PORT, baud=UNO_BAUD, timeout=READ_TIMEOUT)
-    try:
-        cli.open()
-    except Exception as e:
-        print(f"포트 연결 실패: {e}\n하드웨어 연결을 확인하세요.")
-        return
-
-    input_unit = "deg"
-    print_help_menu()
+def main():
+    sysm = SteeringBridgeSystem()
 
     try:
+        sysm.open()
+        print("[INFO] 포트 연결 완료")
+        print_help()
+
         while True:
-            cmd = input(f"({input_unit})> ").strip().lower()
+            cmd = input("> ").strip().lower()
             if not cmd:
                 continue
 
             if cmd in ("q", "quit", "exit"):
                 break
 
-            elif cmd in ("h", "help", "?"):
-                print_help_menu()
+            elif cmd == "en":
+                sysm.enable_drive()
 
-            elif cmd == "unit":
-                input_unit = "inc" if input_unit == "deg" else "deg"
-                print(f"[설정] 입력 단위: {input_unit}")
-
-            elif cmd == "status_unit":
-                cli.status_unit = "inc" if cli.status_unit == "deg" else "deg"
-                print(f"[설정] 출력 단위: {cli.status_unit}")
-
-            elif cmd.startswith("abs "):
-                parts = cmd.split()
-                if len(parts) < 2:
-                    continue
-
-                user_val = float(parts[1])
-                target_val = user_val * INC_PER_DEG if input_unit == "deg" else user_val
-
-                # 1) 예측 계산 (상태 변경 없이)
-                raw_pred = cli.inj.apply(target_val, update_state=False)
-                comp_cmd = cli.cal.pre_compensate(target_val)
-                comp_pred = cli.inj.apply(comp_cmd, update_state=False)
-
-                # 2) "이번에 실제로 가게 할 값" 결정
-                if MOVE_TO_PREDICTED:
-                    # 보정 ON이면 comp_pred로, OFF면 raw_pred로 "실제 이동"
-                    desired_move = comp_pred if cli.cal.any_comp_on() else raw_pred
-                    send_pos = int(round(desired_move))
-                else:
-                    # 정석: 보정 ON이면 comp_cmd, OFF면 target 그대로
-                    send_pos = int(round(comp_cmd)) if cli.cal.any_comp_on() else int(round(target_val))
-
-                final_cmd = f"abs {send_pos}"
-                cli.send(final_cmd)
-
-                # 3) 시뮬 상태도 "그 명령을 보냈다"로 업데이트(로그/다음 스텝 일관성)
-                _ = cli.inj.apply(float(send_pos), update_state=True)
-
-                div = INC_PER_DEG if cli.status_unit == "deg" else 1.0
-                u_str = "deg" if cli.status_unit == "deg" else "inc"
-
-                print("\n[ABS 명령]")
-                print(f" - 입력 목표(target)     : {target_val/div:.3f} {u_str}")
-                print(f" - Raw 예측(raw_pred)    : {raw_pred/div:.3f} {u_str}")
-                print(f" - CompCmd(보정명령)     : {comp_cmd/div:.3f} {u_str}")
-                print(f" - Comp 예측(comp_pred)  : {comp_pred/div:.3f} {u_str}")
-                print(f" - 실제 전송(abs)        : {send_pos/div:.3f} {u_str}  (cmd: '{final_cmd}')\n")
-
-                cli.read_status_burst(seconds=0.6)
+            elif cmd == "rt":
+                sysm.toggle_rt()
 
             elif cmd == "cal":
-                print("\n[cal] 오차 스캔...")
-                targets_cw = np.linspace(-360 * INC_PER_DEG, 360 * INC_PER_DEG, 100000)
-                actuals_cw = np.array([cli.inj.apply(t, update_state=False) for t in targets_cw])
-                targets_ccw = np.linspace(360 * INC_PER_DEG, -360 * INC_PER_DEG, 100000)
-                actuals_ccw = np.array([cli.inj.apply(t, update_state=False) for t in targets_ccw])
-                cli.cal.system_identification(targets_cw, actuals_cw, targets_ccw, actuals_ccw)
-                print("[완료] 학습 완료.\n")
-                print(f" - a_est = {cli.cal.m_est:.6f}")
-                print(f" - b_est = {cli.cal.k_est:.3f} (inc)\n")
+                sysm.calibrate_from_model()
 
-            elif cmd == "cal2":
-                print("\n[cal2] e6 ratio 추론...")
-                pos_0 = cli.inj.apply(cli.inj.prev_cmd, update_state=False)
-
-                cmd_cw = cli.inj.prev_cmd + 10000.0
-                pos_1 = cli.inj.apply(cmd_cw, update_state=True)
-                cli.cal.e6_cw_ratio_est = ((pos_1 - pos_0) / 10000.0) - 1.0
-
-                pos_2 = cli.inj.apply(cli.inj.prev_cmd, update_state=False)
-                cmd_ccw = cli.inj.prev_cmd - 10000.0
-                pos_3 = cli.inj.apply(cmd_ccw, update_state=True)
-                cli.cal.e6_ccw_ratio_est = ((pos_3 - pos_2) / (-10000.0)) - 1.0
-
-                cli.cal.prev_target = cmd_ccw
-                cli.cal.prev_r7_cmd = cmd_ccw
-
-                print(f" - CW ratio est : {cli.cal.e6_cw_ratio_est*100:+.2f}%")
-                print(f" - CCW ratio est: {cli.cal.e6_ccw_ratio_est*100:+.2f}%\n")
-
-            elif cmd == "en":
-                cli._drain_queue()
-                cli.send(CMD_EN)
-                time.sleep(0.05)
-                cli.send(CMD_SPD_1000)
-                print("Sent: en + spd 1000")
-                cli.read_status_burst(seconds=1.2)
-
-            elif cmd == "p":
-                if cli._log_enabled:
-                    cli.stop_logging()
-                    print("[INFO] 모니터링 OFF")
-                else:
-                    cli._drain_queue()
-                    cli.start_logging()
-                    print("[INFO] 모니터링 ON")
-
-            # --- E toggles ---
+            # Errors
             elif cmd == "e1":
-                on = cli.inj.toggle_e1()
-                print(f"[E1] {'ON' if on else 'OFF'}  a={cli.inj._a_err:.4f}, b={cli.inj._b_err:.1f}")
+                on = sysm.inj.toggle_e1()
+                print(f"[E1] {'ON' if on else 'OFF'}  a={sysm.inj._a_err:.4f}, b={sysm.inj._b_err:.1f}")
             elif cmd == "e3":
-                print(f"[E3] {'ON' if cli.inj.toggle_e3() else 'OFF'}")
+                print(f"[E3] {'ON' if sysm.inj.toggle_e3() else 'OFF'}")
             elif cmd == "e4":
-                print(f"[E4] {'ON' if cli.inj.toggle_e4() else 'OFF'}")
+                print(f"[E4] {'ON' if sysm.inj.toggle_e4() else 'OFF'}")
             elif cmd == "e5":
-                print(f"[E5] {'ON' if cli.inj.toggle_e5() else 'OFF'}")
+                print(f"[E5] {'ON' if sysm.inj.toggle_e5() else 'OFF'}")
             elif cmd == "e6":
-                print(f"[E6] {'ON' if cli.inj.toggle_e6() else 'OFF'}")
+                print(f"[E6] {'ON' if sysm.inj.toggle_e6() else 'OFF'}")
 
-            # --- R toggles ---
+            # Compensation
             elif cmd == "r1":
-                cli.cal.r1_on = not cli.cal.r1_on
-                print(f"[R1] {'ON' if cli.cal.r1_on else 'OFF'}")
+                sysm.cal.r1_on = not sysm.cal.r1_on
+                print(f"[R1] {'ON' if sysm.cal.r1_on else 'OFF'}")
             elif cmd == "r2":
-                cli.cal.r2_on = not cli.cal.r2_on
-                print(f"[R2] {'ON' if cli.cal.r2_on else 'OFF'}")
+                sysm.cal.r2_on = not sysm.cal.r2_on
+                print(f"[R2] {'ON' if sysm.cal.r2_on else 'OFF'}")
             elif cmd == "r3":
-                cli.cal.r3_on = not cli.cal.r3_on
-                print(f"[R3] {'ON' if cli.cal.r3_on else 'OFF'}")
+                sysm.cal.r3_on = not sysm.cal.r3_on
+                print(f"[R3] {'ON' if sysm.cal.r3_on else 'OFF'}")
             elif cmd == "r4":
-                cli.cal.r4_on = not cli.cal.r4_on
-                print(f"[R4] {'ON' if cli.cal.r4_on else 'OFF'}")
+                sysm.cal.r4_on = not sysm.cal.r4_on
+                print(f"[R4] {'ON' if sysm.cal.r4_on else 'OFF'}")
             elif cmd == "r5":
-                cli.cal.r5_on = not cli.cal.r5_on
-                print(f"[R5] {'ON' if cli.cal.r5_on else 'OFF'}")
+                sysm.cal.r5_on = not sysm.cal.r5_on
+                print(f"[R5] {'ON' if sysm.cal.r5_on else 'OFF'}")
             elif cmd == "r6":
-                cli.cal.r6_on = not cli.cal.r6_on
-                if cli.cal.r6_on:
-                    cli.cal.r7_on = False
-                print(f"[R6] {'ON' if cli.cal.r6_on else 'OFF'}")
+                sysm.cal.r6_on = not sysm.cal.r6_on
+                if sysm.cal.r6_on:
+                    sysm.cal.r7_on = False
+                print(f"[R6] {'ON' if sysm.cal.r6_on else 'OFF'}")
             elif cmd == "r7":
-                cli.cal.r7_on = not cli.cal.r7_on
-                if cli.cal.r7_on:
-                    cli.cal.r6_on = False
-                print(f"[R7] {'ON' if cli.cal.r7_on else 'OFF'}")
+                sysm.cal.r7_on = not sysm.cal.r7_on
+                if sysm.cal.r7_on:
+                    sysm.cal.r6_on = False
+                print(f"[R7] {'ON' if sysm.cal.r7_on else 'OFF'}")
 
             else:
-                cli.send(cmd)
-                print("Sent. Status:")
-                cli.read_status_burst(seconds=0.6)
+                print("Unknown command")
+                print_help()
 
     finally:
-        cli.stop_logging()
-        cli.close()
+        sysm.close()
         print("시스템 종료.")
 
 
 if __name__ == "__main__":
-    interactive_main()
+    main()
