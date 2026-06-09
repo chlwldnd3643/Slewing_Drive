@@ -1,6 +1,5 @@
 #include <SPI.h>
 #include <Wire.h>
-#include <AS5600.h>
 #include "mcp2515_can.h"
 
 /* ===== [1] Library Compatibility Shims ===== */
@@ -17,16 +16,14 @@
 /* ===== [2] Hardware & Calibration Setup ===== */
 const uint8_t PIN_CS = 9;
 mcp2515_can CAN(PIN_CS);
-AS5600 encoder;
 
+// 엔코더가 없으므로 드라이버 명령치 기반 역산 상수를 그대로 활용합니다.
 const float DEC_PER_RPM = 17896.14f;
 const float INC_PER_DEG = (182.0f * 70.0f * 150.0f) / 62.0f;
-const float ENC_RES     = 4096.0f;
-const float ENC_DIR     = -1.0f;
 
-float   g_encCorrection = 35.0f / 360.0f;
-long    g_offsetPulse   = 0;
-uint8_t NODE_ID         = 1;
+// 소프트웨어 내부 위치 관리를 위한 누적 목표 각도 변수
+float   g_currentCalculatedAngle = 0.0f;
+uint8_t NODE_ID                 = 1;
 
 /* ===== [3] CANopen SDO TX helpers ===== */
 bool SDO_write_u32(uint16_t idx, uint8_t sub, uint32_t val) {
@@ -51,11 +48,9 @@ bool SDO_write_u8(uint16_t idx, uint8_t sub, uint8_t val) {
 
 // Read Statusword (0x6041) via SDO. Returns true on success.
 bool SDO_read_statusword(uint16_t* out_sw) {
-  // SDO Read request: cmd=0x40, idx=0x6041 (LE: 41 60), sub=0
   uint8_t req[8] = { 0x40, 0x41, 0x60, 0x00, 0, 0, 0, 0 };
   if (CAN.sendMsgBuf(0x600 + NODE_ID, 0, 8, req) != CAN_OK) return false;
 
-  // Wait for response (max 50 ms)
   unsigned long t0 = millis();
   while ((millis() - t0) < 50) {
     if (CAN_MSGAVAIL == CAN.checkReceive()) {
@@ -64,7 +59,6 @@ bool SDO_read_statusword(uint16_t* out_sw) {
       CAN.readMsgBuf(&len, buf);
       unsigned long id = CAN.getCanId();
       if ((id & 0x7FF) == (uint16_t)(0x580 + NODE_ID)) {
-        // Expected response: cmd=0x4B (2-byte read), idx LE = 41 60, data in buf[4..5]
         if (buf[0] == 0x4B && buf[1] == 0x41 && buf[2] == 0x60) {
           *out_sw = (uint16_t)buf[4] | ((uint16_t)buf[5] << 8);
           return true;
@@ -84,32 +78,15 @@ void setProfileSpeedRpm(float rpm) {
 }
 
 /* ===== [4] Settle detection - drive's Target_Reached flag ===== */
-//
-// Strategy:
-//   The drive itself reports "target reached" via Statusword bit10.
-//   This is far more reliable than watching an external AS5600,
-//   because the output shaft moves slowly (170:1 reduction) and
-//   small AS5600 changes can be misread as "stopped".
-//
-//   Statusword bit10 is sometimes set even before motion starts
-//   (residual from previous move), so we first wait for it to
-//   CLEAR (motion confirmed started), then wait for it to SET
-//   (motion confirmed finished).
-//
-//   bit10:
-//     0 = target NOT reached
-//     1 = target reached
 bool waitForTargetReached(uint16_t timeout_ms = 8000) {
   Serial.print(F(" -> moving"));
   uint16_t sw;
 
   // Phase 1: wait until bit10 clears (motion has started)
-  // Some drives keep bit10=1 from previous move. We wait up to 300ms
-  // for it to drop, but skip if drive is already showing not-reached.
   unsigned long t0 = millis();
   while ((millis() - t0) < 300) {
     if (SDO_read_statusword(&sw)) {
-      if (!(sw & (1 << 10))) break;     // bit10 = 0, motion in progress
+      if (!(sw & (1 << 10))) break; 
     }
     delay(10);
   }
@@ -119,7 +96,7 @@ bool waitForTargetReached(uint16_t timeout_ms = 8000) {
   uint8_t dot_div = 0;
   while ((millis() - t0) < timeout_ms) {
     if (SDO_read_statusword(&sw)) {
-      if (sw & (1 << 10)) {              // target reached!
+      if (sw & (1 << 10)) { 
         Serial.println(F(" [reached]"));
         return true;
       }
@@ -136,7 +113,7 @@ void printMenu() {
   Serial.println(F("  en      : Enable motor (default 1000 RPM)"));
   Serial.println(F("  spd <n> : Set RPM speed (calibrated)"));
   Serial.println(F("  abs <n> : Move to absolute angle (deg)"));
-  Serial.println(F("  z       : Zero current AS5600 position"));
+  Serial.println(F("  z       : Zero current software position"));
   Serial.println(F("  h       : Show this help"));
   Serial.println(F("=========================================="));
 }
@@ -144,8 +121,7 @@ void printMenu() {
 /* ===== [5] Main ===== */
 void setup() {
   Serial.begin(115200);
-  Wire.begin();
-  encoder.begin(4);
+  Wire.begin(); // 타 장치 디바이스 구동 유지를 위해 Wire는 남겨둡니다.
 
   if (CAN.begin(CAN_250KBPS, MCP_16MHZ) != CAN_OK) {
     Serial.println(F("CAN Init Failed!"));
@@ -176,17 +152,25 @@ void loop() {
     }
     else if (cmd.startsWith("abs ")) {
       float target = cmd.substring(4).toFloat();
-      SDO_write_u32(0x607A, 0x00, (long)(target * INC_PER_DEG));
+      
+      // 입력받은 타겟 각도를 드라이버 펄스로 변환하여 전송
+      long targetPulse = (long)(target * INC_PER_DEG);
+      SDO_write_u32(0x607A, 0x00, targetPulse);
+      
+      // 모터 물리 구동 완료 대기
       waitForTargetReached();
 
-      long rel = (encoder.rawAngle() - g_offsetPulse) * ENC_DIR;
-      float actual = (rel / ENC_RES) * 360.0f * g_encCorrection;
-      Serial.print(F(">> Move complete. Current angle: "));
-      Serial.print(actual, 2); Serial.println(F(" deg"));
+      // 하드웨어 엔코더 피드백 대신, 타겟 펄스 기반 역산으로 현재 위치 결정
+      g_currentCalculatedAngle = (float)targetPulse / INC_PER_DEG;
+      
+      Serial.print(F(">> Move complete. Target Pulse: ")); Serial.print(targetPulse);
+      Serial.print(F(" | Current angle: "));
+      Serial.print(g_currentCalculatedAngle, 2); Serial.println(F(" deg"));
     }
     else if (cmd == "z") {
-      g_offsetPulse = encoder.rawAngle();
-      Serial.println(F(">> Zero set"));
+      // 소프트웨어 기준점 영점 초기화
+      g_currentCalculatedAngle = 0.0f;
+      Serial.println(F(">> Zero command (Software reference cleared)"));
     }
     else if (cmd == "h") {
       printMenu();
